@@ -162,6 +162,7 @@ from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.speculative.speculative_controller import SpeculativeController
 from sglang.srt.tracing.trace import (
     process_tracing_init,
     trace_event_batch,
@@ -345,6 +346,13 @@ class Scheduler(
 
         # Init request dispatcher
         self.init_request_dispatcher()
+
+        # Init speculative controller
+        self.spec_controller = None
+        if self.spec_algorithm.is_eagle() and self.server_args.speculative_num_steps:
+            self.spec_controller = SpeculativeController(
+                initial_steps=self.server_args.speculative_num_steps
+            )
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -2143,8 +2151,16 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        if self.spec_controller is not None and batch.forward_mode.is_decode():
+            batch.speculative_num_steps = self.spec_controller.get_num_steps()
+        elif self.server_args.speculative_num_steps:
+            batch.speculative_num_steps = self.server_args.speculative_num_steps
+
         # Run forward
         if self.is_generation:
+            # Record execution start time for TPOT calculation
+            batch.batch_execution_start_time = time.time()
+
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()

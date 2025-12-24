@@ -350,6 +350,31 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+
+            if hasattr(self, "spec_controller") and self.spec_controller is not None:
+                # result.accept_length_per_req_cpu stores (accept_len - 1) which is the number of accepted draft tokens
+                if result.accept_length_per_req_cpu:
+                    accept_lens = result.accept_length_per_req_cpu
+                elif result.accept_lens is not None:
+                    # Fallback if not populated (e.g. non-overlap V1?)
+                    accept_lens = [x - 1 for x in result.accept_lens.tolist()]
+                else:
+                    accept_lens = []
+
+                if accept_lens:
+                    # Calculate latency
+                    latency = time.time() - batch.batch_execution_start_time
+                    # Get the steps used for this batch
+                    steps = (
+                        batch.speculative_num_steps
+                        or self.server_args.speculative_num_steps
+                        or 1
+                    )
+
+                    self.spec_controller.update_with_step(
+                        batch.batch_size(), steps, accept_lens, latency
+                    )
+
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 

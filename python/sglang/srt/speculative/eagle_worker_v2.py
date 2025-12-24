@@ -267,6 +267,10 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
+        # Update speculative_num_steps if provided
+        if model_worker_batch.speculative_num_steps is not None:
+            self.speculative_num_steps = model_worker_batch.speculative_num_steps
+
         draft_input: EagleDraftInput = model_worker_batch.spec_info
         forward_batch, can_cuda_graph = draft_input.prepare_for_v2_draft(
             self.req_to_token_pool,
@@ -278,6 +282,14 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         # Run draft
+        if can_cuda_graph:
+            if (
+                self.cuda_graph_runner
+                and self.cuda_graph_runner.speculative_num_steps
+                != self.speculative_num_steps
+            ):
+                can_cuda_graph = False
+
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch,
@@ -652,6 +664,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
+
+        # Update speculative_num_steps if provided
+        if batch.speculative_num_steps is not None:
+            self.speculative_num_steps = batch.speculative_num_steps
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info

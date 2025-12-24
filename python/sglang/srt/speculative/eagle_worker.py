@@ -515,6 +515,10 @@ class EAGLEWorker(TpModelWorker):
         )
 
     def draft(self, batch: ScheduleBatch):
+        # Update speculative_num_steps from batch if available
+        if batch.speculative_num_steps is not None:
+            self.speculative_num_steps = batch.speculative_num_steps
+
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
@@ -538,6 +542,15 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
         )
+
+        if can_cuda_graph:
+            if (
+                self.cuda_graph_runner
+                and self.cuda_graph_runner.speculative_num_steps
+                != self.speculative_num_steps
+            ):
+                can_cuda_graph = False
+
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
                 forward_batch
@@ -674,6 +687,9 @@ class EAGLEWorker(TpModelWorker):
         pass
 
     def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        if batch.speculative_num_steps is not None:
+            self.speculative_num_steps = batch.speculative_num_steps
+
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
@@ -881,6 +897,9 @@ class EAGLEWorker(TpModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch):
+        if batch.speculative_num_steps is not None:
+            self.speculative_num_steps = batch.speculative_num_steps
+
         assert isinstance(batch.spec_info, EagleDraftInput)
         # Backup fields that will be modified in-place
         seq_lens_backup = batch.seq_lens.clone()
