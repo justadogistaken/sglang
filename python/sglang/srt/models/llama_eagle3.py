@@ -72,6 +72,9 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        if hasattr(config, "sliding_window") and config.sliding_window is not None:
+            self.self_attn.attn.sliding_window_size = config.sliding_window
+
     def forward(
         self,
         positions: torch.Tensor,
