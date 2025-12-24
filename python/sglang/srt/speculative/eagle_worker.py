@@ -31,6 +31,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.auto_tuner import SpeculativeTuner
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
@@ -92,6 +93,8 @@ class EAGLEWorker(TpModelWorker):
         self.server_args = server_args
         self.topk = server_args.speculative_eagle_topk
         self.speculative_num_steps = server_args.speculative_num_steps
+        self.max_speculative_num_steps = self.speculative_num_steps
+        self.spec_tuner = SpeculativeTuner(self.max_speculative_num_steps)
         self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
         self.enable_nan_detection = server_args.enable_nan_detection
         self.gpu_id = gpu_id
@@ -292,6 +295,11 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=False,
             )
         else:
+            if not batch.forward_mode.is_idle():
+                self.speculative_num_steps = self.spec_tuner.get_step(
+                    batch.batch_size()
+                )
+
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
@@ -299,6 +307,16 @@ class EAGLEWorker(TpModelWorker):
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
+
+            if not batch.forward_mode.is_idle():
+                accepted_tokens = sum(verify_output.accept_length_per_req_cpu)
+                drafted_tokens = batch.batch_size() * self.speculative_num_steps
+                self.spec_tuner.update(
+                    batch.batch_size(),
+                    self.speculative_num_steps,
+                    accepted_tokens,
+                    drafted_tokens,
+                )
 
             with self.draft_tp_context(
                 self.draft_model_runner.tp_group
@@ -535,8 +553,10 @@ class EAGLEWorker(TpModelWorker):
         forward_batch = ForwardBatch.init_new(
             model_worker_batch, self.draft_model_runner
         )
-        can_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
-            forward_batch
+        can_cuda_graph = (
+            self.cuda_graph_runner
+            and self.cuda_graph_runner.can_run(forward_batch)
+            and self.speculative_num_steps == self.max_speculative_num_steps
         )
         if can_cuda_graph:
             parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
@@ -934,6 +954,7 @@ class EAGLEWorker(TpModelWorker):
         can_cuda_graph = (
             self.cuda_graph_runner_for_draft_extend
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
+            and self.speculative_num_steps == self.max_speculative_num_steps
         )
         if can_cuda_graph:
             logits_output = self.cuda_graph_runner_for_draft_extend.replay(
