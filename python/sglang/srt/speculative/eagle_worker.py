@@ -1,3 +1,4 @@
+import json
 import logging
 import time
 from typing import List, Optional, Tuple
@@ -124,11 +125,22 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
         elif server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(server_args.speculative_token_map)
-            server_args.json_model_override_args = (
-                f'{{"hot_vocab_size": {len(self.hot_token_id)}}}'
-            )
+            try:
+                override_args = json.loads(server_args.json_model_override_args)
+            except Exception:
+                override_args = {}
+            override_args["hot_vocab_size"] = len(self.hot_token_id)
+            server_args.json_model_override_args = json.dumps(override_args)
         else:
             self.hot_token_id = None
+
+        if server_args.speculative_draft_max_window is not None:
+            try:
+                override_args = json.loads(server_args.json_model_override_args)
+            except Exception:
+                override_args = {}
+            override_args["sliding_window"] = server_args.speculative_draft_max_window
+            server_args.json_model_override_args = json.dumps(override_args)
 
         # Init draft worker
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
