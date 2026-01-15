@@ -70,9 +70,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        self.max_num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
-        self.max_num_token = self.max_bs * self.num_tokens_per_bs
+        self.max_num_token = self.max_bs * self.max_num_tokens_per_bs
 
         self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -83,7 +83,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
         )
-        self.extend_seq_lens_cpu = [self.num_tokens_per_bs] * self.max_bs
+        self.extend_seq_lens_cpu = [self.max_num_tokens_per_bs] * self.max_bs
 
         if self.enable_torch_compile:
             set_torch_compile_config()
@@ -128,10 +128,10 @@ class EAGLEDraftExtendCudaGraphRunner:
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
             )
             self.extend_seq_lens = torch.full(
-                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+                (self.max_bs,), self.max_num_tokens_per_bs, dtype=torch.int32
             )
             self.accept_length = torch.full(
-                (self.max_bs,), self.num_tokens_per_bs, dtype=torch.int32
+                (self.max_bs,), self.max_num_tokens_per_bs, dtype=torch.int32
             )
 
             if self.require_gathered_buffer:
@@ -166,7 +166,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             self.next_token_logits_buffer = torch.zeros(
                 (
                     (
-                        self.max_bs * self.num_tokens_per_bs
+                        self.max_bs * self.max_num_tokens_per_bs
                         if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2
                         else self.max_bs
                     ),
@@ -183,6 +183,17 @@ class EAGLEDraftExtendCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def get_steps_for_batch(self, batch_size: int) -> int:
+        if self.disable_padding:
+            bs = batch_size
+        else:
+            index = bisect.bisect_left(self.capture_bs, batch_size)
+            if index >= len(self.capture_bs):
+                bs = self.capture_bs[-1]
+            else:
+                bs = self.capture_bs[index]
+        return self.eagle_worker.get_speculative_num_steps(bs)
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -229,9 +240,14 @@ class EAGLEDraftExtendCudaGraphRunner:
         CudaGraphRunner.capture(self)
 
     def capture_one_batch_size(self, bs: int, forward: Callable, stream_idx: int = 0):
+        num_tokens_per_bs = self.eagle_worker.get_speculative_num_steps(bs) + 1
+        self.extend_seq_lens[:bs].fill_(num_tokens_per_bs)
+        self.accept_length[:bs].fill_(num_tokens_per_bs)
+        self.extend_seq_lens_cpu[:bs] = [num_tokens_per_bs] * bs
+
         graph = self._create_graph()
         stream = self.stream
-        num_tokens = bs * self.num_tokens_per_bs
+        num_tokens = bs * num_tokens_per_bs
 
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
@@ -378,7 +394,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens // self.num_tokens_per_bs
+                max_num_tokens // self.max_num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 else max_num_tokens
             )
@@ -387,12 +403,14 @@ class EAGLEDraftExtendCudaGraphRunner:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
         bs = self.capture_bs[index]
-        if bs * self.num_tokens_per_bs != num_tokens:
+        num_tokens_per_bs = self.eagle_worker.get_speculative_num_steps(bs) + 1
+
+        if bs * num_tokens_per_bs != num_tokens:
             self.seq_lens.fill_(self.seq_len_fill_value)
             self.out_cache_loc.zero_()
             self.positions.zero_()
-            self.accept_length.fill_(self.num_tokens_per_bs)
-            self.extend_seq_lens.fill_(self.num_tokens_per_bs)
+            self.accept_length.fill_(num_tokens_per_bs)
+            self.extend_seq_lens.fill_(num_tokens_per_bs)
 
         # Common inputs
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
@@ -400,7 +418,7 @@ class EAGLEDraftExtendCudaGraphRunner:
         if forward_batch.extend_seq_lens is not None:
             self.extend_seq_lens[:raw_bs].copy_(forward_batch.extend_seq_lens)
         else:
-            self.extend_seq_lens[:raw_bs].fill_(self.num_tokens_per_bs)
+            self.extend_seq_lens[:raw_bs].fill_(num_tokens_per_bs)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         if (
@@ -414,7 +432,7 @@ class EAGLEDraftExtendCudaGraphRunner:
 
         # TODO(ch-wan): support num_token_non_padded
         if self.require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
+            self.global_num_tokens_gpu.fill_(bs * num_tokens_per_bs)
             self.global_num_tokens_for_logprob_gpu.fill_(bs)
 
         if forward_batch.seq_lens_cpu is not None:
@@ -425,11 +443,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         if forward_batch.extend_seq_lens_cpu is not None:
             self.extend_seq_lens_cpu[:raw_bs] = forward_batch.extend_seq_lens_cpu
         else:
-            self.extend_seq_lens_cpu[:raw_bs] = [self.num_tokens_per_bs] * raw_bs
+            self.extend_seq_lens_cpu[:raw_bs] = [num_tokens_per_bs] * raw_bs
         if bs > raw_bs:
-            self.extend_seq_lens_cpu[raw_bs:bs] = [self.num_tokens_per_bs] * (
-                bs - raw_bs
-            )
+            self.extend_seq_lens_cpu[raw_bs:bs] = [num_tokens_per_bs] * (bs - raw_bs)
         forward_batch.spec_info.extend_seq_lens_cpu = list(
             self.extend_seq_lens_cpu[:bs]
         )

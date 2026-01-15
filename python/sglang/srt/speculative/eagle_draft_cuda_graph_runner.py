@@ -157,6 +157,18 @@ class EAGLEDraftCudaGraphRunner:
 
         return is_bs_supported
 
+    def get_steps_for_batch(self, batch_size: int) -> int:
+        if self.disable_padding:
+            bs = batch_size
+        else:
+            index = bisect.bisect_left(self.capture_bs, batch_size)
+            if index >= len(self.capture_bs):
+                # Fallback to max_bs if larger (though can_run should prevent this)
+                bs = self.capture_bs[-1]
+            else:
+                bs = self.capture_bs[index]
+        return self.eagle_worker.get_speculative_num_steps(bs)
+
     def _create_graph(self):
         return torch.cuda.CUDAGraph()
 
@@ -180,6 +192,11 @@ class EAGLEDraftCudaGraphRunner:
     def capture_one_batch_size(
         self, num_seqs: int, forward: Callable, stream_idx: int = 0
     ):
+        num_steps = self.eagle_worker.get_speculative_num_steps(num_seqs)
+        draft_token_num = min(
+            self.model_runner.server_args.speculative_num_draft_tokens,
+            num_steps * self.topk,
+        )
         graph = self._create_graph()
         stream = self.stream
         num_tokens = num_seqs * self.num_tokens_per_bs
@@ -190,7 +207,7 @@ class EAGLEDraftCudaGraphRunner:
         seq_lens_cpu = self.seq_lens_cpu[:num_seqs]
         extend_seq_lens = self.extend_seq_lens[:num_seqs]
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:num_seqs]
-        out_cache_loc = self.out_cache_loc[: num_tokens * self.speculative_num_steps]
+        out_cache_loc = self.out_cache_loc[: num_tokens * num_steps]
         positions = self.positions[:num_tokens]
         mrope_positions = self.mrope_positions[:, :num_tokens]
         hidden_states = self.hidden_states[:num_seqs]
@@ -293,7 +310,9 @@ class EAGLEDraftCudaGraphRunner:
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
 
-            ret = self.eagle_worker.draft_forward(forward_batch)
+            ret = self.eagle_worker.draft_forward(
+                forward_batch, num_steps=num_steps, draft_token_num=draft_token_num
+            )
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
@@ -341,11 +360,12 @@ class EAGLEDraftCudaGraphRunner:
             self.positions.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
+        num_steps = self.eagle_worker.get_speculative_num_steps(bs)
 
         # Common inputs
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
-        self.out_cache_loc[: raw_num_token * self.speculative_num_steps].copy_(
-            forward_batch.out_cache_loc
+        self.out_cache_loc[: raw_num_token * num_steps].copy_(
+            forward_batch.out_cache_loc[: raw_num_token * num_steps]
         )
         self.positions[:raw_num_token].copy_(forward_batch.positions)
         self.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
