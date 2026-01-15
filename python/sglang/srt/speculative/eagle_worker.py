@@ -198,6 +198,30 @@ class EAGLEWorker(TpModelWorker):
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
+        # Dynamic speculative steps map (Batch Size -> Steps)
+        # This is a placeholder. You can load this from a file or config.
+        # As batch size increases, we generally want fewer speculative steps.
+        self.spec_steps_map = {
+            1: self.speculative_num_steps,
+            2: self.speculative_num_steps,
+            4: max(1, self.speculative_num_steps - 1),
+            8: max(1, self.speculative_num_steps - 2),
+            16: max(1, self.speculative_num_steps - 3),
+            32: 1,
+            64: 1,
+            128: 1,
+        }
+
+    def get_speculative_num_steps(self, batch_size: int) -> int:
+        if batch_size in self.spec_steps_map:
+            return self.spec_steps_map[batch_size]
+        # Fallback: find the largest key <= batch_size
+        keys = sorted(self.spec_steps_map.keys())
+        for key in reversed(keys):
+            if batch_size >= key:
+                return self.spec_steps_map[key]
+        return self.speculative_num_steps
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
         draft_backend_factory = DraftBackendFactory(
@@ -365,7 +389,7 @@ class EAGLEWorker(TpModelWorker):
             model_worker_batch.seq_lens_cpu,
         )
 
-    def _draft_preprocess_decode(self, batch: ScheduleBatch):
+    def _draft_preprocess_decode(self, batch: ScheduleBatch, num_steps: int):
         if isinstance(batch.tree_cache, SWAChunkCache):
             for req in batch.reqs:
                 batch.tree_cache.evict_swa(
@@ -388,10 +412,10 @@ class EAGLEWorker(TpModelWorker):
         # [       topk 0         ] [       topk 1         ]
         # [iter=0, iter=1, iter=2] [iter=0, iter=1, iter=2]
         if self.page_size == 1:
-            # TODO: We only need self.speculative_num_steps - 1 * topk cache loc
+            # TODO: We only need num_steps - 1 * topk cache loc
             out_cache_loc, token_to_kv_pool_state_backup = alloc_token_slots(
                 batch.tree_cache,
-                num_seqs * self.speculative_num_steps * self.topk,
+                num_seqs * num_steps * self.topk,
                 backup_state=True,
             )
         else:
@@ -400,11 +424,11 @@ class EAGLEWorker(TpModelWorker):
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     batch.seq_lens,
-                    self.speculative_num_steps,
+                    num_steps,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
-                seq_lens_cpu = batch.seq_lens_cpu + self.speculative_num_steps
-                extend_num_tokens = num_seqs * self.speculative_num_steps
+                seq_lens_cpu = batch.seq_lens_cpu + num_steps
+                extend_num_tokens = num_seqs * num_steps
             else:
                 # In this case, the last partial page needs to be duplicated.
                 # KV cache layout in batch.req_to_token_pool.req_to_token:
@@ -427,14 +451,14 @@ class EAGLEWorker(TpModelWorker):
                     batch.req_to_token_pool.req_to_token,
                     batch.req_pool_indices,
                     batch.seq_lens,
-                    self.speculative_num_steps,
+                    num_steps,
                     self.topk,
                     self.page_size,
                 )
                 prefix_lens_cpu = batch.seq_lens_cpu
                 last_page_lens_cpu = prefix_lens_cpu % self.page_size
                 num_new_pages_per_topk = (
-                    last_page_lens_cpu + self.speculative_num_steps + self.page_size - 1
+                    last_page_lens_cpu + num_steps + self.page_size - 1
                 ) // self.page_size
                 seq_lens_cpu = (
                     prefix_lens_cpu // self.page_size * self.page_size
@@ -482,10 +506,10 @@ class EAGLEWorker(TpModelWorker):
             duplicate_cache_len,
             batch.req_to_token_pool.req_to_token.shape[1],
             self.topk,
-            self.speculative_num_steps,
+            num_steps,
             self.page_size,
             next_power_of_2(num_seqs),
-            next_power_of_2(self.speculative_num_steps + self.page_size),
+            next_power_of_2(num_steps + self.page_size),
         )
 
         if self.page_size > 1 and self.topk > 1:
@@ -494,10 +518,8 @@ class EAGLEWorker(TpModelWorker):
                     target_cache_loc, source_cache_loc
                 )
             # Remove padded slots
-            # TODO: We only need self.speculative_num_steps - 1 cache loc
-            out_cache_loc = out_cache_loc[
-                : num_seqs * self.topk * self.speculative_num_steps
-            ]
+            # TODO: We only need num_steps - 1 cache loc
+            out_cache_loc = out_cache_loc[: num_seqs * self.topk * num_steps]
 
         batch.out_cache_loc = out_cache_loc
         batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
@@ -518,8 +540,19 @@ class EAGLEWorker(TpModelWorker):
         # Parse args
         if batch.forward_mode.is_idle():
             self._draft_preprocess_idle(batch)
+            current_spec_steps = self.speculative_num_steps
         else:
-            self._draft_preprocess_decode(batch)
+            if self.cuda_graph_runner:
+                current_spec_steps = self.cuda_graph_runner.get_steps_for_batch(
+                    batch.batch_size()
+                )
+            else:
+                current_spec_steps = self.get_speculative_num_steps(batch.batch_size())
+            self._draft_preprocess_decode(batch, current_spec_steps)
+
+        current_draft_token_num = min(
+            self.speculative_num_draft_tokens, current_spec_steps * self.topk
+        )
 
         spec_info = batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -544,22 +577,21 @@ class EAGLEWorker(TpModelWorker):
             )
         else:
             forward_batch.can_run_dp_cuda_graph = False
-            if (
-                not forward_batch.forward_mode.is_idle()
-                and self.speculative_num_steps > 1
-            ):
+            if not forward_batch.forward_mode.is_idle() and current_spec_steps > 1:
                 # Skip attention backend init for idle mode or 1-step draft
                 self.draft_attn_backend.init_forward_metadata(forward_batch)
             # Run forward steps
             parent_list, top_scores_index, draft_tokens = self.draft_forward(
-                forward_batch
+                forward_batch,
+                num_steps=current_spec_steps,
+                draft_token_num=current_draft_token_num,
             )
 
         if batch.forward_mode.is_idle():
             return EagleVerifyInput.create_idle_input(
                 self.topk,
-                self.speculative_num_steps,
-                self.speculative_num_draft_tokens,
+                current_spec_steps,
+                current_draft_token_num,
             )
 
         (
@@ -577,8 +609,8 @@ class EAGLEWorker(TpModelWorker):
             batch.seq_lens,
             batch.seq_lens_sum,
             self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
+            current_spec_steps,
+            current_draft_token_num,
         )
 
         return EagleVerifyInput(
@@ -589,15 +621,25 @@ class EAGLEWorker(TpModelWorker):
             retrive_next_token=retrive_next_token,
             retrive_next_sibling=retrive_next_sibling,
             retrive_cum_len=None,
-            spec_steps=self.speculative_num_steps,
+            spec_steps=current_spec_steps,
             topk=self.topk,
-            draft_token_num=self.server_args.speculative_num_draft_tokens,
+            draft_token_num=current_draft_token_num,
             capture_hidden_mode=CaptureHiddenMode.FULL,
             seq_lens_sum=forward_batch.seq_lens_sum,
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def draft_forward(
+        self,
+        forward_batch: ForwardBatch,
+        num_steps: int = None,
+        draft_token_num: int = None,
+    ):
+        if num_steps is None:
+            num_steps = self.speculative_num_steps
+        if draft_token_num is None:
+            draft_token_num = self.speculative_num_draft_tokens
+
         # Parse args
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
@@ -609,13 +651,11 @@ class EAGLEWorker(TpModelWorker):
         )
         if self.hot_token_id is not None:
             topk_index = self.hot_token_id[topk_index]
-        # TODO: We only need self.speculative_num_steps - 1 cache loc
+        # TODO: We only need num_steps - 1 cache loc
         out_cache_loc = out_cache_loc.reshape(
-            forward_batch.batch_size, self.topk, self.speculative_num_steps
+            forward_batch.batch_size, self.topk, num_steps
         )
-        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(
-            self.speculative_num_steps, -1
-        )
+        out_cache_loc = out_cache_loc.permute((2, 0, 1)).reshape(num_steps, -1)
 
         # Return values
         score_list: List[torch.Tensor] = []
@@ -624,7 +664,7 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
+        for i in range(num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
             )
@@ -633,7 +673,7 @@ class EAGLEWorker(TpModelWorker):
             parents_list.append(tree_info[2])
 
             # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
+            if i == num_steps - 1:
                 break
 
             # Set inputs
@@ -664,7 +704,7 @@ class EAGLEWorker(TpModelWorker):
             hidden_states = logits_output.hidden_states
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+            score_list, token_list, parents_list, draft_token_num
         )
 
         return parent_list, top_scores_index, draft_tokens
@@ -907,11 +947,20 @@ class EAGLEWorker(TpModelWorker):
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
 
-        batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
+        if self.cuda_graph_runner_for_draft_extend:
+            current_spec_steps = (
+                self.cuda_graph_runner_for_draft_extend.get_steps_for_batch(
+                    batch.batch_size()
+                )
+            )
+        else:
+            current_spec_steps = self.get_speculative_num_steps(batch.batch_size())
+
+        batch.spec_info.num_tokens_per_batch = current_spec_steps + 1
         batch.spec_info.num_tokens_for_logprob_per_batch = 1
         batch.spec_info.prepare_extend_after_decode(
             batch,
-            self.speculative_num_steps,
+            current_spec_steps,
         )
         batch.forward_mode = (
             ForwardMode.DRAFT_EXTEND
