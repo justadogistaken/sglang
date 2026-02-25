@@ -350,6 +350,27 @@ class Scheduler(
         else:
             self.model_worker = self.draft_worker
 
+        # Start suffix cache server for distributed cache synchronization (RL framework support)
+        self.suffix_cache_server = None
+        if (
+            self.spec_algorithm.is_suffix()
+            and server_args.speculative_suffix_cache_server_port > 0
+        ):
+            from sglang.srt.speculative.suffix_cache_server import SuffixCacheServer
+
+            # Get the cache adapter from the draft worker
+            if hasattr(self.draft_worker, "ngram_cache"):
+                cache_adapter = self.draft_worker.ngram_cache
+                self.suffix_cache_server = SuffixCacheServer(
+                    port=server_args.speculative_suffix_cache_server_port,
+                    cache_adapter=cache_adapter,
+                )
+                self.suffix_cache_server.start()
+            else:
+                logger.warning(
+                    "Suffix cache server requested but draft worker has no ngram_cache attribute"
+                )
+
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -573,6 +594,12 @@ class Scheduler(
                 (GetLoadReqInput, self.get_load),
             ]
         )
+
+    def __del__(self):
+        """Clean up resources when the scheduler is destroyed."""
+        if hasattr(self, "suffix_cache_server") and self.suffix_cache_server is not None:
+            self.suffix_cache_server.stop()
+            self.suffix_cache_server = None
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)

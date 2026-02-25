@@ -237,18 +237,117 @@ class SuffixCacheAdapter:
 
         return draft_view, tree_mask
 
-    def batch_put(self, batch_req_ids: List[str], batch_tokens: List[List[int]]):
+    def batch_put(
+        self,
+        batch_req_ids: List[str],
+        batch_tokens: List[List[int]],
+        batch_prompts: Optional[List[List[int]]] = None,
+    ):
         """
-        No-op: cache updates now happen inside batch_get before speculation.
-        Kept for interface compatibility with NGRAMWorker.
+        Update the global cache with verified tokens.
+
+        This method is called in two scenarios:
+        1. After normal speculative decoding verification (tokens already updated via batch_get)
+        2. When speculative decoding is disabled due to batch size threshold (need to update cache)
+        3. External cache update from other instances (need full prompt + response)
+
+        Args:
+            batch_req_ids: List of request IDs
+            batch_tokens: List of full token sequences (prompt + response for external update,
+                          or just the updated portion for internal update)
+            batch_prompts: Optional list of prompt-only sequences. Required when updating
+                          cache for requests that are not currently active (external update
+                          or spec disabled from start). If None, tokens are treated as
+                          continuation of existing requests.
         """
-        _ = batch_tokens  # Intentional placeholder to satisfy interface.
-        for idx, sglang_req_id in enumerate(batch_req_ids):
-            if sglang_req_id not in self.req_state:
-                logger.error(
-                    f"[BATCH_PUT {idx}] Called for unknown request {sglang_req_id}! "
-                    f"This should not happen - batch_get must be called first."
-                )
+        # Cleanup requests that are no longer active in the current batch
+        # This is important when speculative decoding is disabled, as batch_get won't be called
+        active_req_ids = set(batch_req_ids)
+        self._cleanup_inactive_requests(active_req_ids)
+
+        for idx, (sglang_req_id, tokens) in enumerate(
+            zip(batch_req_ids, batch_tokens)
+        ):
+            if not tokens:
+                continue
+
+            # Check if this request is already being tracked (normal spec flow)
+            if sglang_req_id in self.req_state:
+                cache_req_id, last_length = self.req_state[sglang_req_id]
+                current_length = len(tokens)
+
+                # If we have new tokens to add (normal spec flow)
+                if current_length > last_length:
+                    new_tokens = tokens[last_length:current_length]
+                    if cache_req_id in self.suffix_cache.active_requests:
+                        # Update via add_active_response for active requests (incremental update)
+                        self.suffix_cache.add_active_response(cache_req_id, new_tokens)
+                        self.req_state[sglang_req_id][1] = current_length
+                    else:
+                        # Request is not active anymore, need to re-add to cache
+                        # Use prompt if provided, otherwise use the tokens as both prompt and response
+                        if batch_prompts is not None and idx < len(batch_prompts):
+                            prompt = batch_prompts[idx]
+                            response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
+                        else:
+                            # Fallback: treat all tokens as prompt, no response
+                            prompt = tokens
+                            response = []
+                        
+                        self._add_completed_request_to_cache(
+                            sglang_req_id, prompt, response
+                        )
+                        self.req_state.pop(sglang_req_id, None)
+            else:
+                # Request not tracked (spec was disabled from start, or external update)
+                # Need prompt to properly add to cache
+                if batch_prompts is not None and idx < len(batch_prompts):
+                    prompt = batch_prompts[idx]
+                    response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
+                else:
+                    # Fallback: treat all tokens as prompt (less effective but still works)
+                    prompt = tokens
+                    response = []
+                
+                self._add_completed_request_to_cache(sglang_req_id, prompt, response)
+
+    def _add_completed_request_to_cache(
+        self, req_id: str, prompt: List[int], response: List[int]
+    ):
+        """
+        Add a completed request's tokens to the global cache.
+        
+        This uses the standard flow: start_request -> add_active_response -> stop_request
+        to properly cache the prompt + response in the global suffix tree.
+        """
+        try:
+            # Start the request (adds prompt to local tree and allocates slot in global tree)
+            self.suffix_cache.start_request(req_id, prompt)
+            
+            # Add response tokens (updates both local and global tree)
+            if response:
+                self.suffix_cache.add_active_response(req_id, response)
+            
+            # Stop the request (removes from local tree, keeps in global tree)
+            self.suffix_cache.stop_request(req_id)
+        except ValueError as e:
+            # Handle case where request might already be cached or active
+            if "already active" in str(e):
+                # Request is already active, try to add response and stop
+                try:
+                    if response:
+                        self.suffix_cache.add_active_response(req_id, response)
+                    self.suffix_cache.stop_request(req_id)
+                except ValueError:
+                    pass  # Ignore errors in cleanup
+            elif "already cached" in str(e) or "not active" in str(e):
+                # Try to evict and re-add
+                try:
+                    if req_id in self.suffix_cache.cached_requests:
+                        self.suffix_cache.evict_cached_response(req_id)
+                    self._add_completed_request_to_cache(req_id, prompt, response)
+                except ValueError:
+                    pass  # Ignore errors in retry
 
     def synchronize(self):
         """No-op for suffix cache (no async operations)."""

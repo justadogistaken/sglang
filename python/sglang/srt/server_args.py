@@ -408,6 +408,8 @@ class ServerArgs:
     speculative_suffix_min_token_prob: float = 0.1
     # For adaptive speculative decoding
     speculative_disable_batch_size_threshold: int = 0
+    # For distributed suffix cache synchronization (RL framework support)
+    speculative_suffix_cache_server_port: int = 0  # 0 means disabled
 
     # Expert parallelism
     ep_size: int = 1
@@ -3012,6 +3014,15 @@ class ServerArgs:
             default=ServerArgs.speculative_disable_batch_size_threshold,
             help="Disable speculative decoding when batch size exceeds this threshold. "
             "Set to 0 (default) to always enable speculative decoding.",
+        )
+        parser.add_argument(
+            "--speculative-suffix-cache-server-port",
+            type=int,
+            default=ServerArgs.speculative_suffix_cache_server_port,
+            help="Port for the suffix cache server. When set to a non-zero value, "
+            "starts an HTTP server that accepts requests to update the suffix cache. "
+            "Useful for synchronizing cache state across multiple rollout instances "
+            "in RL frameworks. Default is 0 (disabled).",
         )
 
         # Expert parallelism

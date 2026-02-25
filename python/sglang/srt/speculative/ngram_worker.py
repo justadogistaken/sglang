@@ -282,17 +282,24 @@ class NGRAMWorker:
                         )
                 pt += 1
 
-    def _update_ngram_cache(self, batch: ScheduleBatch):
+    def _update_ngram_cache(
+        self, batch: ScheduleBatch, next_token_ids: Optional[List[int]] = None
+    ):
         batch_tokens = []
-        for req in batch.reqs:
-            # FIXME: Whether to insert 'extend' into the cache or not, after testing,
-            # there is not much difference, so we will not insert it for now.
-            # if batch.forward_mode.is_extend():
-            #     put_ids = req.origin_input_ids + req.output_ids
-            # else:
-            put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.branch_length
-            )
+        for i, req in enumerate(batch.reqs):
+            # If next_token_ids is provided (spec disabled case), append it to output_ids
+            # for cache update without modifying req.output_ids (scheduler will update it later)
+            if next_token_ids is not None:
+                # Use origin_input_ids + output_ids + new_token for cache update
+                output_ids_with_new = req.output_ids + [next_token_ids[i]]
+                put_ids = self._efficient_concat_last_n(
+                    req.origin_input_ids, output_ids_with_new, self.branch_length
+                )
+            else:
+                # Normal case: spec was enabled, output_ids already includes verified tokens
+                put_ids = self._efficient_concat_last_n(
+                    req.origin_input_ids, req.output_ids, self.branch_length
+                )
             batch_tokens.append(put_ids)
         self.ngram_cache.batch_put(batch_tokens)
 
@@ -340,6 +347,13 @@ class NGRAMWorker:
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
+
+            # Update cache even when speculative decoding is disabled
+            # This ensures that subsequent requests with smaller batch sizes
+            # can benefit from the cached token patterns
+            # Pass the newly generated tokens since req.output_ids hasn't been updated yet
+            self._update_ngram_cache(batch, batch_result.next_token_ids.tolist())
+
             return GenerationBatchResult(
                 logits_output=batch_result.logits_output,
                 next_token_ids=batch_result.next_token_ids,

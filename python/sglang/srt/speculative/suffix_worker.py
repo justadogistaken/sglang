@@ -90,17 +90,26 @@ class SuffixWorker(NGRAMWorker):
 
         return req_drafts, mask
 
-    def _update_ngram_cache(self, batch):
+    def _update_ngram_cache(self, batch, next_token_ids=None):
         """
         Override to pass FULL token sequences for cache updates.
         """
         batch_req_ids = []
         batch_tokens = []
-        for req in batch.reqs:
+        batch_prompts = []
+        for i, req in enumerate(batch.reqs):
             # Pass request ID for stable tracking
             batch_req_ids.append(req.rid)
-            # Pass FULL token sequence for delta computation
-            full_tokens = req.origin_input_ids + req.output_ids
+            # Pass prompt separately for proper cache initialization
+            batch_prompts.append(req.origin_input_ids)
+            # If next_token_ids is provided (spec disabled case), append it to output_ids
+            # for cache update without modifying req.output_ids
+            if next_token_ids is not None:
+                output_ids_with_new = req.output_ids + [next_token_ids[i]]
+                full_tokens = req.origin_input_ids + output_ids_with_new
+            else:
+                # Normal case: spec was enabled, output_ids already includes verified tokens
+                full_tokens = req.origin_input_ids + req.output_ids
             batch_tokens.append(full_tokens)
 
-        self.ngram_cache.batch_put(batch_req_ids, batch_tokens)
+        self.ngram_cache.batch_put(batch_req_ids, batch_tokens, batch_prompts)
