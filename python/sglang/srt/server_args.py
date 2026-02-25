@@ -406,6 +406,8 @@ class ServerArgs:
     speculative_suffix_max_cached_requests: int = 10000
     speculative_suffix_max_spec_factor: float = 1.0
     speculative_suffix_min_token_prob: float = 0.1
+    # For adaptive speculative decoding
+    speculative_disable_batch_size_threshold: int = 0
 
     # Expert parallelism
     ep_size: int = 1
@@ -3003,6 +3005,13 @@ class ServerArgs:
             help="The minimum token probability for suffix decoding. Will only speculate "
             "tokens with estimated probability (based on frequency counts) greater than "
             "or equal to this value.",
+        )
+        parser.add_argument(
+            "--speculative-disable-batch-size-threshold",
+            type=int,
+            default=ServerArgs.speculative_disable_batch_size_threshold,
+            help="Disable speculative decoding when batch size exceeds this threshold. "
+            "Set to 0 (default) to always enable speculative decoding.",
         )
 
         # Expert parallelism

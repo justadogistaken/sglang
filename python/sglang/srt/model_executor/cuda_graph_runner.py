@@ -285,6 +285,22 @@ class CudaGraphRunner:
                     self.model_runner.server_args.speculative_num_draft_tokens
                 )
 
+        # For adaptive speculative decoding (NGRAM/SUFFIX with disable_batch_size_threshold > 0),
+        # we need to capture two sets of CUDA graphs:
+        # 1. Speculative decoding graphs (TARGET_VERIFY mode, num_tokens_per_bs = draft_tokens)
+        # 2. Normal decoding graphs (DECODE mode, num_tokens_per_bs = 1)
+        self.enable_adaptive_spec = (
+            (
+                model_runner.spec_algorithm.is_ngram()
+                or model_runner.spec_algorithm.is_suffix()
+            )
+            and model_runner.server_args.speculative_disable_batch_size_threshold > 0
+        )
+        if self.enable_adaptive_spec:
+            self.graphs_no_spec = {}
+            self.output_buffers_no_spec = {}
+            self.num_tokens_per_bs_no_spec = 1
+
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -422,11 +438,25 @@ class CudaGraphRunner:
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{cuda_graph_bs}"
 
-        is_bs_supported = (
-            graph_key in self.graphs
-            if self.disable_padding
-            else cuda_graph_bs <= self.max_bs
+        # For adaptive speculative decoding, check if we should use no-spec graphs
+        use_no_spec_graph = (
+            self.enable_adaptive_spec
+            and forward_batch.spec_algorithm == SpeculativeAlgorithm.NONE
         )
+
+        if use_no_spec_graph:
+            # Check no-spec graphs
+            is_bs_supported = (
+                graph_key in self.graphs_no_spec
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+            )
+        else:
+            is_bs_supported = (
+                graph_key in self.graphs
+                if self.disable_padding
+                else cuda_graph_bs <= self.max_bs
+            )
 
         if self.require_mlp_sync:
             is_bs_supported = is_bs_supported and forward_batch.can_run_dp_cuda_graph
@@ -466,6 +496,13 @@ class CudaGraphRunner:
             or self.model_runner.spec_algorithm.is_suffix()
             else True
         )
+
+        # For adaptive speculative decoding with no-spec graph,
+        # check that input_ids.numel() matches batch_size * 1
+        if use_no_spec_graph:
+            is_ngram_supported = (
+                forward_batch.batch_size == forward_batch.input_ids.numel()
+            )
 
         return (
             is_bs_supported
@@ -545,6 +582,40 @@ class CudaGraphRunner:
                     # Save gemlite cache after each capture
                     save_gemlite_cache()
 
+        def _capture_one_stream_no_spec(stream_idx: Optional[int] = None):
+            """Capture CUDA graphs for normal decoding (without speculative decoding)."""
+            capture_range = (
+                tqdm.tqdm(list(reversed(self.capture_bs)))
+                if get_tensor_model_parallel_rank() == 0
+                else reversed(self.capture_bs)
+            )
+            for i, bs in enumerate(capture_range):
+                if get_tensor_model_parallel_rank() == 0:
+                    avail_mem = get_available_gpu_memory(
+                        self.model_runner.device,
+                        self.model_runner.gpu_id,
+                        empty_cache=False,
+                    )
+                    capture_range.set_description(
+                        f"Capturing no-spec batches ({bs=} {avail_mem=:.2f} GB)"
+                    )
+
+                with patch_model(
+                    self.model_runner.model,
+                    bs in self.compile_bs,
+                    num_tokens=bs * self.num_tokens_per_bs_no_spec,
+                    tp_group=self.model_runner.tp_group,
+                ) as forward:
+                    (
+                        graph,
+                        output_buffers,
+                    ) = self.capture_one_batch_size_no_spec(bs, forward, stream_idx)
+                    key = bs if stream_idx is None else f"{stream_idx}_{bs}"
+                    self.graphs_no_spec[key] = graph
+                    self.output_buffers_no_spec[key] = output_buffers
+
+                    save_gemlite_cache()
+
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
@@ -553,6 +624,9 @@ class CudaGraphRunner:
                 with graph_capture() as graph_capture_context, profile_context as prof:
                     self.stream = graph_capture_context.stream
                     _capture_one_stream()
+                    # Capture no-spec graphs for adaptive speculative decoding
+                    if self.enable_adaptive_spec:
+                        _capture_one_stream_no_spec()
             else:
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
@@ -561,6 +635,8 @@ class CudaGraphRunner:
                     ) as graph_capture_context, profile_context as prof:
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
+                        if self.enable_adaptive_spec:
+                            _capture_one_stream_no_spec(i)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
@@ -754,6 +830,176 @@ class CudaGraphRunner:
 
         return graph, out
 
+    def capture_one_batch_size_no_spec(
+        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+    ):
+        """Capture CUDA graph for normal decoding without speculative decoding.
+
+        This is used for adaptive speculative decoding where we may dynamically
+        disable speculative decoding for large batches.
+        """
+        graph = self._create_device_graph()
+        stream = self.stream
+        num_tokens = bs * self.num_tokens_per_bs_no_spec  # = bs * 1
+
+        # Graph inputs
+        input_ids = self.input_ids[:num_tokens]
+        req_pool_indices = self.req_pool_indices[:bs]
+        seq_lens = self.seq_lens[:bs]
+        seq_lens_cpu = self.seq_lens_cpu[:bs]
+        out_cache_loc = self.out_cache_loc[:num_tokens]
+        positions = self.positions[:num_tokens]
+        if self.is_encoder_decoder:
+            encoder_lens = self.encoder_lens[:bs]
+        else:
+            encoder_lens = None
+        mrope_positions = self.mrope_positions[:, :num_tokens]
+        next_token_logits_buffer = self.next_token_logits_buffer[:num_tokens]
+        self.num_token_non_padded[...] = num_tokens
+
+        # pipeline parallelism
+        if self.pp_size > 1:
+            pp_proxy_tensors = PPProxyTensors(
+                {k: v[:num_tokens] for k, v in self.pp_proxy_tensors.items()}
+            )
+
+        if self.require_mlp_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens] * self.dp_size,
+                    dtype=torch.int32,
+                    device=input_ids.device,
+                )
+            )
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [num_tokens] * self.dp_size,
+                    dtype=torch.int32,
+                    device=input_ids.device,
+                )
+            )
+            global_dp_buffer_len = num_tokens * self.dp_size
+        elif self.require_attn_tp_gather:
+            self.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=input_ids.device,
+                )
+            )
+            self.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [num_tokens],
+                    dtype=torch.int32,
+                    device=input_ids.device,
+                )
+            )
+            global_dp_buffer_len = num_tokens
+        else:
+            global_dp_buffer_len = None
+
+        # No spec_info for normal decoding
+        spec_info = None
+
+        if self.model_runner.server_args.enable_lora:
+            lora_ids = [None] * bs
+        else:
+            lora_ids = None
+
+        if stream_idx is None:
+            attn_backend = self.model_runner.attn_backend
+        else:
+            assert self.enable_pdmux
+            attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,  # Normal decode mode
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            next_token_logits_buffer=next_token_logits_buffer,
+            orig_seq_lens=seq_lens,
+            req_to_token_pool=self.model_runner.req_to_token_pool,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
+            attn_backend=attn_backend,
+            out_cache_loc=out_cache_loc,
+            seq_lens_sum=seq_lens.sum().item(),
+            encoder_lens=encoder_lens,
+            return_logprob=False,
+            positions=positions,
+            global_num_tokens_gpu=self.global_num_tokens_gpu,
+            global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            mrope_positions=mrope_positions,
+            spec_algorithm=SpeculativeAlgorithm.NONE,  # No speculative decoding
+            spec_info=spec_info,
+            capture_hidden_mode=self.capture_hidden_mode,
+            num_token_non_padded=self.num_token_non_padded,
+            global_forward_mode=ForwardMode.DECODE,
+            lora_ids=lora_ids,
+        )
+        self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+
+        if lora_ids is not None:
+            self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+
+        # Attention backend
+        attn_backend.init_forward_metadata_capture_cuda_graph(
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
+            forward_batch.forward_mode,
+            forward_batch.spec_info,
+        )
+
+        # Run and capture
+        def run_once():
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                num_tokens,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
+            set_is_extend_in_batch(False)
+
+            kwargs = {}
+            if (
+                self.pp_size > 1
+                and "pp_proxy_tensors" in inspect.signature(forward).parameters
+            ):
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
+
+            logits_output_or_pp_proxy_tensors = forward(
+                input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
+            return logits_output_or_pp_proxy_tensors
+
+        self.deepep_adapter.capture(is_extend_in_batch=False)
+
+        for _ in range(2):
+            self.device_module.synchronize()
+            self.model_runner.tp_group.barrier()
+            run_once()
+
+        if get_global_graph_memory_pool() is None:
+            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+        set_graph_pool_id(get_global_graph_memory_pool())
+        out = self._capture_graph(
+            graph, get_global_graph_memory_pool(), stream, run_once
+        )
+
+        return graph, out
+
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 
         # If the required capture_hidden_mode changes, we need to recapture the graph
@@ -793,8 +1039,18 @@ class CudaGraphRunner:
     ):
         self.recapture_if_needed(forward_batch)
 
+        # For adaptive speculative decoding, determine which graph set to use
+        self.use_no_spec_graph = (
+            self.enable_adaptive_spec
+            and forward_batch.spec_algorithm == SpeculativeAlgorithm.NONE
+        )
+
+        # Use actual input_ids size for raw_num_token
         raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        if self.use_no_spec_graph:
+            raw_num_token = raw_bs * self.num_tokens_per_bs_no_spec
+        else:
+            raw_num_token = raw_bs * self.num_tokens_per_bs
 
         # Pad
         if self.require_mlp_tp_gather:
@@ -836,12 +1092,21 @@ class CudaGraphRunner:
         if forward_batch.mrope_positions is not None:
             self.mrope_positions[:, :raw_num_token].copy_(forward_batch.mrope_positions)
         if self.require_gathered_buffer:
-            self.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            self.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+            num_tokens_for_fill = bs * (
+                self.num_tokens_per_bs_no_spec
+                if self.use_no_spec_graph
+                else self.num_tokens_per_bs
+            )
+            self.global_num_tokens_gpu.fill_(num_tokens_for_fill)
+            self.global_num_tokens_for_logprob_gpu.fill_(num_tokens_for_fill)
         if enable_num_token_non_padded(self.model_runner.server_args):
             num_token_non_padded = forward_batch.num_token_non_padded
             if self.require_gathered_buffer and not self.nsa_enable_prefill_cp:
-                tokens_per_rank = bs // self.attn_tp_size * self.num_tokens_per_bs
+                tokens_per_rank = bs // self.attn_tp_size * (
+                    self.num_tokens_per_bs_no_spec
+                    if self.use_no_spec_graph
+                    else self.num_tokens_per_bs
+                )
                 num_local_token_non_padded = torch.clamp(
                     num_token_non_padded - tokens_per_rank * self.attn_tp_rank,
                     min=0,
@@ -865,13 +1130,17 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.model_runner.attn_backend
+        # For no-spec graph, use DECODE mode; otherwise use the captured forward mode
+        replay_forward_mode = (
+            ForwardMode.DECODE if self.use_no_spec_graph else self.capture_forward_mode
+        )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             self.req_pool_indices[:bs],
             self.seq_lens[:bs],
             forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
             self.encoder_lens[:bs] if self.is_encoder_decoder else None,
-            self.capture_forward_mode,
+            replay_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
         )
@@ -901,8 +1170,15 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
-        output = self.output_buffers[graph_key]
+
+        # Select the appropriate graph based on whether we're using no-spec graph
+        if self.use_no_spec_graph:
+            self.graphs_no_spec[graph_key].replay()
+            output = self.output_buffers_no_spec[graph_key]
+        else:
+            self.graphs[graph_key].replay()
+            output = self.output_buffers[graph_key]
+
         if isinstance(output, LogitsProcessorOutput):
             return LogitsProcessorOutput(
                 next_token_logits=output.next_token_logits[: self.raw_num_token],
