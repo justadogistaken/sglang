@@ -23,6 +23,7 @@ LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 
 
 class KvMetrics:
+
     def __init__(self):
         self.request_active_slots = None
         self.request_total_slots = None
@@ -35,15 +36,16 @@ class KvMetrics:
 
 
 class SchedulerMetricsMixin:
-    def init_metrics(
-        self: Scheduler, tp_rank: int, pp_rank: int, dp_rank: Optional[int]
-    ):
+
+    def init_metrics(self: Scheduler, tp_rank: int, pp_rank: int,
+                     dp_rank: Optional[int]):
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
 
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
-        self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
+        self.step_time_dict = defaultdict(
+            list)  # Dict[batch size -> step time]
 
         # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
         self.spec_num_accepted_tokens = 0
@@ -73,10 +75,10 @@ class SchedulerMetricsMixin:
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
-                kv_events_config, self.attn_dp_rank
-            )
+                kv_events_config, self.attn_dp_rank)
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
+    def update_spec_metrics(self: Scheduler, bs: int,
+                            num_accepted_tokens: int):
         self.spec_num_accepted_tokens += num_accepted_tokens + bs
         self.spec_num_forward_ct += bs
         self.num_generated_tokens += num_accepted_tokens
@@ -107,10 +109,8 @@ class SchedulerMetricsMixin:
             ) = self._get_swa_token_info()
             num_used = max(full_num_used, swa_num_used)
             token_usage = max(full_token_usage, swa_token_usage)
-            token_usage_msg = (
-                f"full token usage: {full_token_usage:.2f}, "
-                f"swa token usage: {swa_token_usage:.2f}, "
-            )
+            token_usage_msg = (f"full token usage: {full_token_usage:.2f}, "
+                               f"swa token usage: {swa_token_usage:.2f}, ")
         elif self.is_hybrid_gdn:
             (
                 full_num_used,
@@ -124,10 +124,8 @@ class SchedulerMetricsMixin:
             ) = self._get_mamba_token_info()
             num_used = full_num_used
             token_usage = full_token_usage
-            token_usage_msg = (
-                f"full token usage: {full_token_usage:.2f}, "
-                f"mamba usage: {mamba_usage:.2f}, "
-            )
+            token_usage_msg = (f"full token usage: {full_token_usage:.2f}, "
+                               f"mamba usage: {mamba_usage:.2f}, ")
         else:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"token usage: {token_usage:.2f}, "
@@ -135,15 +133,13 @@ class SchedulerMetricsMixin:
         self.stats.new_token_ratio = adder.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
 
-        f = (
-            f"Prefill batch{iter_msg}, "
-            f"#new-seq: {len(can_run_list)}, "
-            f"#new-token: {adder.log_input_tokens}, "
-            f"#cached-token: {adder.log_hit_tokens}, "
-            f"{token_usage_msg}"
-            f"#running-req: {running_bs}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
-        )
+        f = (f"Prefill batch{iter_msg}, "
+             f"#new-seq: {len(can_run_list)}, "
+             f"#new-token: {adder.log_input_tokens}, "
+             f"#cached-token: {adder.log_hit_tokens}, "
+             f"{token_usage_msg}"
+             f"#running-req: {running_bs}, "
+             f"#queue-req: {len(self.waiting_queue)}, ")
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#prealloc-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
@@ -155,9 +151,8 @@ class SchedulerMetricsMixin:
         if self.enable_metrics:
             # Basics
             total_tokens = adder.log_input_tokens + adder.log_hit_tokens
-            cache_hit_rate = (
-                adder.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
-            )
+            cache_hit_rate = (adder.log_hit_tokens /
+                              total_tokens if total_tokens > 0 else 0.0)
 
             self.stats.num_running_reqs = running_bs
             self.stats.num_running_reqs_offline_batch = running_bs_offline_batch
@@ -179,22 +174,18 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
-                )
+                    self.disagg_prefill_bootstrap_queue.queue)
                 self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
-                )
+                    self.disagg_prefill_inflight_queue)
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
                 self.stats.kv_transfer_bootstrap_ms = self.kv_transfer_bootstrap_ms
                 self.stats.kv_transfer_alloc_ms = self.kv_transfer_alloc_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
-                )
+                    self.disagg_decode_prealloc_queue.queue)
                 self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
-                )
+                    self.disagg_decode_transfer_queue.queue)
 
             # Others
             self.calculate_utilization()
@@ -202,9 +193,9 @@ class SchedulerMetricsMixin:
             self._emit_kv_metrics()
         self._publish_kv_events()
 
-    def log_decode_stats(
-        self: Scheduler, can_run_cuda_graph: bool, running_batch: ScheduleBatch = None
-    ):
+    def log_decode_stats(self: Scheduler,
+                         can_run_cuda_graph: bool,
+                         running_batch: ScheduleBatch = None):
         batch = running_batch or self.running_batch
 
         gap_latency = time.perf_counter() - self.last_decode_stats_tic
@@ -229,12 +220,10 @@ class SchedulerMetricsMixin:
             ) = self._get_swa_token_info()
             num_used = max(full_num_used, swa_num_used)
             token_usage = max(full_token_usage, swa_token_usage)
-            token_usage_msg = (
-                f"#full token: {full_num_used}, "
-                f"full token usage: {full_token_usage:.2f}, "
-                f"#swa token: {swa_num_used}, "
-                f"swa token usage: {swa_token_usage:.2f}, "
-            )
+            token_usage_msg = (f"#full token: {full_num_used}, "
+                               f"full token usage: {full_token_usage:.2f}, "
+                               f"#swa token: {swa_num_used}, "
+                               f"swa token usage: {swa_token_usage:.2f}, ")
         elif self.is_hybrid_gdn:
             (
                 full_num_used,
@@ -248,43 +237,37 @@ class SchedulerMetricsMixin:
             ) = self._get_mamba_token_info()
             num_used = full_num_used
             token_usage = full_token_usage
-            token_usage_msg = (
-                f"#full token: {full_num_used}, "
-                f"full token usage: {full_token_usage:.2f}, "
-                f"mamba num: {mamba_used}, "
-                f"mamba usage: {mamba_usage:.2f}, "
-            )
+            token_usage_msg = (f"#full token: {full_num_used}, "
+                               f"full token usage: {full_token_usage:.2f}, "
+                               f"mamba num: {mamba_used}, "
+                               f"mamba usage: {mamba_usage:.2f}, ")
         else:
             num_used, token_usage, _, _ = self._get_token_info()
             token_usage_msg = f"#token: {num_used}, token usage: {token_usage:.2f}, "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
-                gap_latency / self.server_args.decode_log_interval
-            )
+                gap_latency / self.server_args.decode_log_interval)
 
         iter_msg = f" [{self.forward_ct}]" if LOG_FORWARD_ITERS else ""
         msg = f"Decode batch{iter_msg}, #running-req: {num_running_reqs}, {token_usage_msg}"
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_num_forward_ct == 0:
             spec_accept_length = 0
             spec_accept_rate = 0
         else:
-            spec_accept_length = (
-                self.spec_num_accepted_tokens / self.spec_num_forward_ct
-            )
+            spec_accept_length = (self.spec_num_accepted_tokens /
+                                  self.spec_num_forward_ct)
             # Calculate acceptance rate: accepted tokens / total draft tokens
-            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
-            num_draft_tokens = (
-                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
-            )
+            draft_tokens_fallback = (self.server_args.speculative_num_steps
+                                     or 0) + 1
+            num_draft_tokens = (self.server_args.speculative_num_draft_tokens
+                                or draft_tokens_fallback)
             total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
 
-            spec_accept_rate = (
-                self.spec_num_accepted_tokens / total_draft_tokens
-                if total_draft_tokens > 0
-                else 0
-            )
+            spec_accept_rate = (self.spec_num_accepted_tokens /
+                                total_draft_tokens
+                                if total_draft_tokens > 0 else 0)
             self.spec_total_num_accepted_tokens += self.spec_num_accepted_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accepted_tokens = self.spec_num_forward_ct = 0
@@ -300,8 +283,7 @@ class SchedulerMetricsMixin:
         msg += (
             f"{'cuda graph' if self.device == 'cuda' else 'cpu graph'}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}, "
-        )
+            f"#queue-req: {len(self.waiting_queue)}, ")
 
         logger.info(msg)
         if self.enable_metrics:
@@ -331,18 +313,14 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = len(
-                    self.disagg_prefill_bootstrap_queue.queue
-                )
+                    self.disagg_prefill_bootstrap_queue.queue)
                 self.stats.num_prefill_inflight_queue_reqs = len(
-                    self.disagg_prefill_inflight_queue
-                )
+                    self.disagg_prefill_inflight_queue)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = len(
-                    self.disagg_decode_prealloc_queue.queue
-                )
+                    self.disagg_decode_prealloc_queue.queue)
                 self.stats.num_decode_transfer_queue_reqs = len(
-                    self.disagg_decode_transfer_queue.queue
-                )
+                    self.disagg_decode_transfer_queue.queue)
 
             # Others
             self.calculate_utilization()
@@ -357,9 +335,8 @@ class SchedulerMetricsMixin:
         kv_metrics = KvMetrics()
         kv_metrics.request_active_slots = self.stats.num_running_reqs
         kv_metrics.request_total_slots = self.max_running_requests
-        kv_metrics.kv_active_blocks = int(
-            self.stats.token_usage * self.max_total_num_tokens
-        )
+        kv_metrics.kv_active_blocks = int(self.stats.token_usage *
+                                          self.max_total_num_tokens)
         kv_metrics.kv_total_blocks = self.max_total_num_tokens
         kv_metrics.num_requests_waiting = self.stats.num_queue_reqs
         kv_metrics.gpu_cache_usage_perc = self.stats.token_usage
@@ -382,12 +359,10 @@ class SchedulerMetricsMixin:
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
-            if (
-                self.stats.max_running_requests_under_SLO is not None
-                and self.stats.max_running_requests_under_SLO > 0
-            ):
+            if (self.stats.max_running_requests_under_SLO is not None
+                    and self.stats.max_running_requests_under_SLO > 0):
                 self.stats.utilization = max(
-                    self.stats.num_running_reqs
-                    / self.stats.max_running_requests_under_SLO,
+                    self.stats.num_running_reqs /
+                    self.stats.max_running_requests_under_SLO,
                     self.stats.token_usage / 0.9,
                 )
