@@ -335,11 +335,28 @@ class NGRAMWorker:
             # Speculative decoding is disabled for large batches
             # prepare_for_decode() returned early because spec_algorithm is not NONE,
             # so we need to manually do the decode preparation here
+            
+            # Set forward_mode to DECODE since we're not doing speculative decoding
+            batch.forward_mode = ForwardMode.DECODE
+            
+            # Clear spec_info to prevent ForwardBatch.from_batch from using old spec positions
+            batch.spec_info = None
+            
             if batch.input_ids is None or len(batch.input_ids) != bs:
                 from sglang.srt.mem_cache.common import alloc_for_decode
 
-                # Set input_ids from output_ids (the last generated token for each request)
-                batch.input_ids = batch.output_ids.clone()
+                # Build input_ids from each request's last token
+                # For old requests: use the last generated token (output_ids[-1])
+                # For new requests (just finished prefill): use the last token of prompt
+                input_ids_list = []
+                for req in batch.reqs:
+                    if len(req.output_ids) > 0:
+                        # Old decode request: use last generated token
+                        input_ids_list.append(req.output_ids[-1])
+                    else:
+                        # New request just finished prefill: use last token of prompt
+                        input_ids_list.append(req.origin_input_ids[-1])
+                batch.input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=batch.device)
                 batch.output_ids = None
 
                 # Allocate KV cache for 1 token per request
@@ -379,6 +396,10 @@ class NGRAMWorker:
             # for a single-token decode. We need to undo these changes before
             # preparing for speculative decoding.
             
+            # Free the KV cache slots allocated by prepare_for_decode()
+            if batch.out_cache_loc is not None:
+                batch.token_to_kv_pool_allocator.free(batch.out_cache_loc)
+            
             # Undo the seq_lens increment
             batch.seq_lens.sub_(1)
             batch.seq_lens_cpu.sub_(1)
@@ -389,11 +410,6 @@ class NGRAMWorker:
             for req in batch.reqs:
                 req.kv_committed_len -= 1
                 req.kv_allocated_len -= 1
-            
-            # Note: We don't need to explicitly free out_cache_loc because
-            # prepare_for_verify will allocate new slots and the old ones
-            # will be handled by the memory pool's normal lifecycle.
-            # The old out_cache_loc will be overwritten anyway.
             
             # Reset input_ids - it will be set properly in prepare_for_verify
             batch.input_ids = None
