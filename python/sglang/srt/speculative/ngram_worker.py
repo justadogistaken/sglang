@@ -307,19 +307,16 @@ class NGRAMWorker:
         bs = batch.batch_size()
         num_accepted_tokens = 0
 
-        # Check if speculative decoding should be disabled based on batch size
-        if (
+        # Determine if speculative decoding should be disabled based on batch size
+        should_disable_spec = (
             self.disable_batch_size_threshold > 0
             and bs > self.disable_batch_size_threshold
-        ):
-            # Skip speculative decoding for large batches
-            # Set spec_algorithm to NONE so that process_batch_result_decode
-            # handles output_ids and other state correctly
-            batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        )
 
-            # When spec_algorithm was not NONE, prepare_for_decode() returned early
-            # without setting input_ids, out_cache_loc, and updating seq_lens.
-            # We need to do these here.
+        if should_disable_spec:
+            # Speculative decoding is disabled for large batches
+            # prepare_for_decode() returned early because spec_algorithm is not NONE,
+            # so we need to manually do the decode preparation here
             if batch.input_ids is None or len(batch.input_ids) != bs:
                 from sglang.srt.mem_cache.common import alloc_for_decode
 
@@ -328,8 +325,6 @@ class NGRAMWorker:
                 batch.output_ids = None
 
                 # Allocate KV cache for 1 token per request
-                # Note: This must be done BEFORE updating seq_lens, as alloc_for_decode
-                # uses seq_lens to compute the write location in req_to_token_pool
                 batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
 
                 # Update req-level memory management fields
@@ -337,7 +332,7 @@ class NGRAMWorker:
                     req.kv_committed_len += 1
                     req.kv_allocated_len += 1
 
-                # Update seq_lens (add 1 for each request) - MUST be after alloc_for_decode
+                # Update seq_lens (add 1 for each request)
                 batch.seq_lens.add_(1)
                 batch.seq_lens_cpu.add_(1)
                 batch.orig_seq_lens.add_(1)
@@ -348,12 +343,6 @@ class NGRAMWorker:
                 model_worker_batch
             )
 
-            # Update cache even when speculative decoding is disabled
-            # This ensures that subsequent requests with smaller batch sizes
-            # can benefit from the cached token patterns
-            # Pass the newly generated tokens since req.output_ids hasn't been updated yet
-            self._update_ngram_cache(batch, batch_result.next_token_ids.tolist())
-
             return GenerationBatchResult(
                 logits_output=batch_result.logits_output,
                 next_token_ids=batch_result.next_token_ids,
@@ -361,6 +350,8 @@ class NGRAMWorker:
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
+        # Spec is enabled (bs <= threshold)
+        # prepare_for_decode() was skipped because spec_algorithm is not NONE
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
 
