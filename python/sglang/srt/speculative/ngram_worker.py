@@ -307,11 +307,29 @@ class NGRAMWorker:
         bs = batch.batch_size()
         num_accepted_tokens = 0
 
+        # For extend mode (prefill), just forward to target worker without spec logic
+        if batch.forward_mode.is_extend():
+            model_worker_batch = batch.get_model_worker_batch()
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
+            return GenerationBatchResult(
+                logits_output=batch_result.logits_output,
+                next_token_ids=batch_result.next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            )
+
         # Determine if speculative decoding should be disabled based on batch size
         should_disable_spec = (
             self.disable_batch_size_threshold > 0
             and bs > self.disable_batch_size_threshold
         )
+
+        # Check if we're transitioning from spec-disabled to spec-enabled state
+        # This happens when batch.spec_algorithm is NONE (was disabled) but now should_enable
+        was_spec_disabled = batch.spec_algorithm.is_none()
+        transitioning_to_spec = was_spec_disabled and not should_disable_spec
 
         if should_disable_spec:
             # Speculative decoding is disabled for large batches
@@ -338,6 +356,9 @@ class NGRAMWorker:
                 batch.orig_seq_lens.add_(1)
                 batch.seq_lens_sum += bs
 
+            # Mark spec as disabled so subsequent logic handles it correctly
+            batch.spec_algorithm = SpeculativeAlgorithm.NONE
+
             model_worker_batch = batch.get_model_worker_batch()
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch
@@ -351,7 +372,35 @@ class NGRAMWorker:
             )
 
         # Spec is enabled (bs <= threshold)
+        if transitioning_to_spec:
+            # We're transitioning from spec-disabled to spec-enabled state.
+            # prepare_for_decode() already executed with spec_algorithm=NONE,
+            # which means input_ids, out_cache_loc, and seq_lens were already updated
+            # for a single-token decode. We need to undo these changes before
+            # preparing for speculative decoding.
+            
+            # Undo the seq_lens increment
+            batch.seq_lens.sub_(1)
+            batch.seq_lens_cpu.sub_(1)
+            batch.orig_seq_lens.sub_(1)
+            batch.seq_lens_sum -= bs
+            
+            # Undo the req-level memory management fields
+            for req in batch.reqs:
+                req.kv_committed_len -= 1
+                req.kv_allocated_len -= 1
+            
+            # Note: We don't need to explicitly free out_cache_loc because
+            # prepare_for_verify will allocate new slots and the old ones
+            # will be handled by the memory pool's normal lifecycle.
+            # The old out_cache_loc will be overwritten anyway.
+            
+            # Reset input_ids - it will be set properly in prepare_for_verify
+            batch.input_ids = None
+            batch.out_cache_loc = None
+
         # prepare_for_decode() was skipped because spec_algorithm is not NONE
+        # (or we just transitioned and reset the state)
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
 
