@@ -1677,18 +1677,18 @@ class ServerArgs:
             # Only disable overlap schedule if no dynamic threshold is set
             # When speculative_disable_batch_size_threshold > 0, we enable overlap
             # to allow dynamic switching between spec and non-spec modes
-            if self.speculative_disable_batch_size_threshold <= 0:
-                self.disable_overlap_schedule = True
-                logger.warning(
-                    "The overlap scheduler and mixed chunked prefill are disabled because of "
-                    "using ngram speculative decoding."
-                )
-            else:
+            if self.speculative_disable_batch_size_threshold > 0:
                 self.disable_overlap_schedule = False
                 logger.info(
                     f"Overlap scheduler is enabled for ngram speculative decoding with "
                     f"dynamic disable threshold={self.speculative_disable_batch_size_threshold}. "
                     f"Speculative decoding will be disabled when batch size > {self.speculative_disable_batch_size_threshold}."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "The overlap scheduler and mixed chunked prefill are disabled because of "
+                    "using ngram speculative decoding."
                 )
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
@@ -1736,18 +1736,18 @@ class ServerArgs:
             # Only disable overlap schedule if no dynamic threshold is set
             # When speculative_disable_batch_size_threshold > 0, we enable overlap
             # to allow dynamic switching between spec and non-spec modes
-            if self.speculative_disable_batch_size_threshold <= 0:
-                self.disable_overlap_schedule = True
-                logger.warning(
-                    "The overlap scheduler and mixed chunked prefill are disabled because of "
-                    "using suffix decoding."
-                )
-            else:
+            if self.speculative_disable_batch_size_threshold > 0:
                 self.disable_overlap_schedule = False
                 logger.info(
                     f"Overlap scheduler is enabled for suffix decoding with "
                     f"dynamic disable threshold={self.speculative_disable_batch_size_threshold}. "
                     f"Speculative decoding will be disabled when batch size > {self.speculative_disable_batch_size_threshold}."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "The overlap scheduler and mixed chunked prefill are disabled because of "
+                    "using suffix decoding."
                 )
             self.enable_mixed_chunk = False
             if self.speculative_num_draft_tokens is None:
