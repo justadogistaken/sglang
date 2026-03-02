@@ -320,66 +320,20 @@ class NGRAMWorker:
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
-        # Determine if speculative decoding should be disabled based on batch size
-        should_disable_spec = (
-            self.disable_batch_size_threshold > 0
-            and bs > self.disable_batch_size_threshold
-        )
-
-        # Check if we're transitioning from spec-disabled to spec-enabled state
-        # This happens when batch.spec_algorithm is NONE (was disabled) but now should_enable
-        was_spec_disabled = batch.spec_algorithm.is_none()
-        transitioning_to_spec = was_spec_disabled and not should_disable_spec
-
-        if should_disable_spec:
-            # Speculative decoding is disabled for large batches
-            # prepare_for_decode() returned early because spec_algorithm is not NONE,
-            # so we need to manually do the decode preparation here
-            
-            # Set forward_mode to DECODE since we're not doing speculative decoding
-            batch.forward_mode = ForwardMode.DECODE
-            
-            # Clear spec_info to prevent ForwardBatch.from_batch from using old spec positions
-            batch.spec_info = None
-            
-            if batch.input_ids is None or len(batch.input_ids) != bs:
-                from sglang.srt.mem_cache.common import alloc_for_decode
-
-                # Build input_ids from each request's last token
-                # For old requests: use the last generated token (output_ids[-1])
-                # For new requests (just finished prefill): use the last token of prompt
-                input_ids_list = []
-                for req in batch.reqs:
-                    if len(req.output_ids) > 0:
-                        # Old decode request: use last generated token
-                        input_ids_list.append(req.output_ids[-1])
-                    else:
-                        # New request just finished prefill: use last token of prompt
-                        input_ids_list.append(req.origin_input_ids[-1])
-                batch.input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device=batch.device)
-                batch.output_ids = None
-
-                # Allocate KV cache for 1 token per request
-                batch.out_cache_loc = alloc_for_decode(batch, token_per_req=1)
-
-                # Update req-level memory management fields
-                for req in batch.reqs:
-                    req.kv_committed_len += 1
-                    req.kv_allocated_len += 1
-
-                # Update seq_lens (add 1 for each request)
-                batch.seq_lens.add_(1)
-                batch.seq_lens_cpu.add_(1)
-                batch.orig_seq_lens.add_(1)
-                batch.seq_lens_sum += bs
-
-            # Mark spec as disabled so subsequent logic handles it correctly
-            batch.spec_algorithm = SpeculativeAlgorithm.NONE
-
+        # Check if speculative decoding is disabled
+        # When batch.spec_algorithm is NONE, it means spec is disabled by scheduler
+        # and prepare_for_decode() has already been executed
+        if batch.spec_algorithm.is_none():
+            # Spec is disabled, just forward to target worker
+            # prepare_for_decode() has already prepared the batch
             model_worker_batch = batch.get_model_worker_batch()
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
+
+            # Update ngram cache with the new token
+            next_token_ids = batch_result.next_token_ids.tolist()
+            self._update_ngram_cache(batch, next_token_ids)
 
             return GenerationBatchResult(
                 logits_output=batch_result.logits_output,
@@ -388,17 +342,17 @@ class NGRAMWorker:
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
 
-        # Spec is enabled (bs <= threshold)
-        if transitioning_to_spec:
-            # We're transitioning from spec-disabled to spec-enabled state.
-            # prepare_for_decode() already executed with spec_algorithm=NONE,
-            # which means input_ids, out_cache_loc, and seq_lens were already updated
-            # for a single-token decode. We need to undo these changes before
-            # preparing for speculative decoding.
-            
+        # Spec is enabled. Check if we're transitioning from spec-disabled to spec-enabled state.
+        # This happens when:
+        # - Previous iteration: batch.spec_algorithm was NONE (spec disabled)
+        #   prepare_for_decode() was executed normally
+        # - Current iteration: batch.spec_algorithm is NGRAM/SUFFIX (spec enabled)
+        #   prepare_for_decode() returned early
+        # We need to undo the decode preparation from the previous iteration.
+        if batch.out_cache_loc is not None and len(batch.out_cache_loc) == bs:
+            # Undo the decode preparation from previous iteration
             # Free the KV cache slots allocated by prepare_for_decode()
-            if batch.out_cache_loc is not None:
-                batch.token_to_kv_pool_allocator.free(batch.out_cache_loc)
+            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc)
             
             # Undo the seq_lens increment
             batch.seq_lens.sub_(1)
@@ -411,12 +365,11 @@ class NGRAMWorker:
                 req.kv_committed_len -= 1
                 req.kv_allocated_len -= 1
             
-            # Reset input_ids - it will be set properly in prepare_for_verify
+            # Reset input_ids - it will be set properly in _prepare_for_speculative_decoding
             batch.input_ids = None
             batch.out_cache_loc = None
 
-        # prepare_for_decode() was skipped because spec_algorithm is not NONE
-        # (or we just transitioned and reset the state)
+        # prepare_for_decode() returned early because spec_algorithm is not NONE
         self._prepare_for_speculative_decoding(batch)
         model_worker_batch = batch.get_model_worker_batch()
 

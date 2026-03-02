@@ -270,6 +270,10 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        # For dynamic speculative decoding: disable spec when batch size exceeds threshold
+        self.speculative_disable_batch_size_threshold = (
+            server_args.speculative_disable_batch_size_threshold
+        )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -1021,11 +1025,18 @@ class Scheduler(
 
     @DynamicGradMode()
     def event_loop_overlap(self):
-        """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        """A scheduler loop that overlaps the CPU processing and GPU computation.
+        
+        This event loop supports dynamic switching between overlap and non-overlap modes:
+        - When batch.enable_overlap=True: queue result, process in next iteration (overlap)
+        - When batch.enable_overlap=False: process result immediately (no delay)
+        """
         self.result_queue: Deque[Tuple[ScheduleBatch, GenerationBatchResult]] = deque()
         disable_consecutive_prefill_overlap = (
             envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
         )
+        # Track if the last batch used overlap mode (for proper result processing)
+        last_batch_used_overlap = False
 
         def pop_and_process():
             # Process the results of the last batch
@@ -1047,22 +1058,34 @@ class Scheduler(
                 and self.last_batch.forward_mode.is_extend()
             )
 
-            if disable_overlap_for_batch:
-                pop_and_process()
+            # Process the previous batch's result if it was queued (overlap mode)
+            # The previous batch's overlap status determines whether to pop from queue
+            if last_batch_used_overlap:
+                if disable_overlap_for_batch:
+                    pop_and_process()
+                elif self.last_batch is not None:
+                    pop_and_process()
 
             batch_result = None
             if batch:
                 batch_result = self.run_batch(batch)
-                self.result_queue.append((batch.copy(), batch_result))
 
-            if self.last_batch:
-                if not disable_overlap_for_batch:
-                    pop_and_process()
-            elif batch is None:
+            # Decide how to handle current batch's result based on its overlap mode
+            if batch and batch.enable_overlap:
+                # Overlap mode: queue the result, process in next iteration
+                self.result_queue.append((batch.copy(), batch_result))
+                self.launch_batch_sample_if_needed(batch_result)
+                last_batch_used_overlap = True
+            else:
+                # Non-overlap mode: process immediately
+                if batch:
+                    self.process_batch_result(batch, batch_result)
+                last_batch_used_overlap = False
+
+            if batch is None and self.last_batch is None:
                 # When the server is idle, do self-check and re-init some states
                 self.self_check_during_idle()
 
-            self.launch_batch_sample_if_needed(batch_result)
             self.last_batch = batch
 
             if envs.SGLANG_ENABLE_RUNTIME_MEM_LEAK_CHECK.get():
@@ -2003,9 +2026,47 @@ class Scheduler(
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
 
+        # Dynamic speculative decoding: determine whether to enable spec or overlap
+        # based on batch size and threshold
+        self._update_batch_spec_state(batch)
+
         # Update batch tensors
         batch.prepare_for_decode()
         return batch
+
+    def _update_batch_spec_state(self, batch: ScheduleBatch):
+        """Update batch's speculative decoding state based on batch size.
+        
+        When batch size > threshold:
+        - Disable speculative decoding (set spec_algorithm to NONE)
+        - Enable overlap scheduling for better performance
+        
+        When batch size <= threshold:
+        - Enable speculative decoding (keep original spec_algorithm)
+        - Disable overlap scheduling (spec requires normal scheduling)
+        """
+        if self.speculative_disable_batch_size_threshold <= 0:
+            # Dynamic threshold not set, use original behavior
+            return
+        
+        bs = batch.batch_size()
+        should_disable_spec = bs > self.speculative_disable_batch_size_threshold
+        
+        if should_disable_spec:
+            # Large batch: disable spec, enable overlap
+            if not batch.spec_algorithm.is_none():
+                # Transitioning from spec to non-spec
+                # Clear spec_info to avoid issues in prepare_for_decode
+                batch.spec_info = None
+                batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            batch.enable_overlap = self.enable_overlap
+        else:
+            # Small batch: enable spec, disable overlap
+            if batch.spec_algorithm.is_none() and self.spec_algorithm.is_ngram_or_suffix():
+                # Transitioning from non-spec to spec
+                # Note: prepare_for_decode will return early because spec_algorithm is not NONE
+                batch.spec_algorithm = self.spec_algorithm
+            batch.enable_overlap = False
 
     # placeholder for override
     def update_cache_from_scheduler(
@@ -2039,11 +2100,14 @@ class Scheduler(
         if self.is_generation:
             batch_or_worker_batch = batch
 
-            if self.enable_overlap or self.spec_algorithm.is_none():
+            # Use batch-level enable_overlap for dynamic control
+            # For prefill batch, batch.enable_overlap is set in init_new from scheduler.enable_overlap
+            # For decode batch, batch.enable_overlap is set in _update_batch_spec_state based on batch size
+            if batch.enable_overlap or batch.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
-            if self.enable_overlap:
+            if batch.enable_overlap:
                 # FIXME: remove this assert
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
                 model_worker_batch = batch_or_worker_batch
@@ -2097,9 +2161,14 @@ class Scheduler(
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
-                batch_result = self.model_worker.forward_batch_generation(
-                    batch_or_worker_batch
+                # When spec is dynamically disabled (batch.spec_algorithm is NONE),
+                # use tp_worker directly instead of draft_worker
+                worker = (
+                    self.tp_worker
+                    if batch.spec_algorithm.is_none()
+                    else self.model_worker
                 )
+                batch_result = worker.forward_batch_generation(batch_or_worker_batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -2170,7 +2239,7 @@ class Scheduler(
         elif batch.forward_mode.is_prebuilt():
             self.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
-            if self.enable_overlap:
+            if batch.enable_overlap:
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
 

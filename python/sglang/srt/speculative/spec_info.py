@@ -176,6 +176,10 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_suffix(self) -> bool:
         return self._has_flag("SUFFIX")
 
+    def is_ngram_or_suffix(self) -> bool:
+        """Check if this is either NGRAM or SUFFIX algorithm."""
+        return self.is_ngram() or self.is_suffix()
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None

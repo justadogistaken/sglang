@@ -1674,17 +1674,28 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
+            # Only disable overlap schedule if no dynamic threshold is set
+            # When speculative_disable_batch_size_threshold > 0, we enable overlap
+            # to allow dynamic switching between spec and non-spec modes
+            if self.speculative_disable_batch_size_threshold <= 0:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "The overlap scheduler and mixed chunked prefill are disabled because of "
+                    "using ngram speculative decoding."
+                )
+            else:
+                self.disable_overlap_schedule = False
+                logger.info(
+                    f"Overlap scheduler is enabled for ngram speculative decoding with "
+                    f"dynamic disable threshold={self.speculative_disable_batch_size_threshold}. "
+                    f"Speculative decoding will be disabled when batch size > {self.speculative_disable_batch_size_threshold}."
+                )
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = (
                     self.speculative_ngram_max_match_window_size
                 )
-            logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
-                "using ngram speculative decoding."
-            )
 
             if (
                 self.speculative_eagle_topk > 1
@@ -1722,7 +1733,22 @@ class ServerArgs:
                     "Max running requests is reset to 48 for suffix decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
+            # Only disable overlap schedule if no dynamic threshold is set
+            # When speculative_disable_batch_size_threshold > 0, we enable overlap
+            # to allow dynamic switching between spec and non-spec modes
+            if self.speculative_disable_batch_size_threshold <= 0:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "The overlap scheduler and mixed chunked prefill are disabled because of "
+                    "using suffix decoding."
+                )
+            else:
+                self.disable_overlap_schedule = False
+                logger.info(
+                    f"Overlap scheduler is enabled for suffix decoding with "
+                    f"dynamic disable threshold={self.speculative_disable_batch_size_threshold}. "
+                    f"Speculative decoding will be disabled when batch size > {self.speculative_disable_batch_size_threshold}."
+                )
             self.enable_mixed_chunk = False
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = (
@@ -1731,10 +1757,6 @@ class ServerArgs:
                 logger.warning(
                     f"Defaulted speculative_num_draft_tokens to {self.speculative_suffix_max_tree_depth} for suffix decoding."
                 )
-            logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
-                "using suffix decoding."
-            )
 
             # Validate parameter ranges
             if self.speculative_suffix_max_tree_depth < 1:
