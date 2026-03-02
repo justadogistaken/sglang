@@ -1875,8 +1875,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result
+        # NOTE: reqs list is shallow-copied to avoid issues when the original batch
+        # is filtered (finished requests are removed). We need to keep references to
+        # all requests that were in the batch when it was copied.
         return ScheduleBatch(
-            reqs=self.reqs,
+            reqs=self.reqs.copy() if self.reqs else [],  # Shallow copy of the list
             req_to_token_pool=self.req_to_token_pool,
             req_pool_indices=self.req_pool_indices,
             model_config=self.model_config,

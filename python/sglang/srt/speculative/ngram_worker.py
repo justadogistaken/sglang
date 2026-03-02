@@ -349,7 +349,17 @@ class NGRAMWorker:
         # - Current iteration: batch.spec_algorithm is NGRAM/SUFFIX (spec enabled)
         #   prepare_for_decode() returned early
         # We need to undo the decode preparation from the previous iteration.
-        if batch.out_cache_loc is not None and len(batch.out_cache_loc) == bs:
+        # 
+        # IMPORTANT: We only undo if out_cache_loc was set for THIS batch (same size).
+        # In overlap mode, the result is processed in the next iteration, so out_cache_loc
+        # might be from the previous (larger) batch that was already processed.
+        # We detect this by checking if out_cache_loc size matches current batch size.
+        if (
+            batch.out_cache_loc is not None 
+            and len(batch.out_cache_loc) == bs
+            and batch.input_ids is not None 
+            and len(batch.input_ids) == bs
+        ):
             # Undo the decode preparation from previous iteration
             # Free the KV cache slots allocated by prepare_for_decode()
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc)

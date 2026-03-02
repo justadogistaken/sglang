@@ -1060,7 +1060,8 @@ class Scheduler(
 
             # Process the previous batch's result if it was queued (overlap mode)
             # The previous batch's overlap status determines whether to pop from queue
-            if last_batch_used_overlap:
+            # Only pop if there's actually something in the queue
+            if last_batch_used_overlap and len(self.result_queue) > 0:
                 if disable_overlap_for_batch:
                     pop_and_process()
                 elif self.last_batch is not None:

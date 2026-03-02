@@ -322,6 +322,12 @@ class SchedulerOutputProcessorMixin:
                 # And all the over-allocated tokens will be freed in `release_kv_cache`.
                 continue
 
+            # Extra safety check: skip if request is already finished
+            # This can happen when processing a queued batch from overlap mode
+            # after some requests have already been finished in a previous iteration
+            if req.finished():
+                continue
+
             new_accepted_len = 1
             if batch.spec_algorithm.is_none():
                 req.output_ids.append(next_token_id)
