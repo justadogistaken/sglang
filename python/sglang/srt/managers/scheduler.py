@@ -1071,7 +1071,12 @@ class Scheduler(
                 batch_result = self.run_batch(batch)
 
             # Decide how to handle current batch's result based on its overlap mode
-            if batch and batch.enable_overlap:
+            # Use the same logic as in run_batch: for extend (prefill) mode with spec enabled,
+            # we should NOT use overlap because draft worker expects ScheduleBatch
+            batch_uses_overlap = batch and batch.enable_overlap and (
+                batch.forward_mode.is_decode() or batch.spec_algorithm.is_none()
+            )
+            if batch_uses_overlap:
                 # Overlap mode: queue the result, process in next iteration
                 self.result_queue.append((batch.copy(), batch_result))
                 self.launch_batch_sample_if_needed(batch_result)
@@ -2103,11 +2108,16 @@ class Scheduler(
             # Use batch-level enable_overlap for dynamic control
             # For prefill batch, batch.enable_overlap is set in init_new from scheduler.enable_overlap
             # For decode batch, batch.enable_overlap is set in _update_batch_spec_state based on batch size
-            if batch.enable_overlap or batch.spec_algorithm.is_none():
+            # NOTE: For extend (prefill) mode, we should NOT use overlap when spec is enabled,
+            # because the draft worker (ngram/suffix) expects ScheduleBatch, not ModelWorkerBatch.
+            use_overlap_for_batch = batch.enable_overlap and (
+                batch.forward_mode.is_decode() or batch.spec_algorithm.is_none()
+            )
+            if use_overlap_for_batch or batch.spec_algorithm.is_none():
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
-            if batch.enable_overlap:
+            if use_overlap_for_batch:
                 # FIXME: remove this assert
                 assert isinstance(batch_or_worker_batch, ModelWorkerBatch)
                 model_worker_batch = batch_or_worker_batch
@@ -2124,7 +2134,14 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.default_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    batch_result = self.model_worker.forward_batch_generation(
+                    # When spec is dynamically disabled (batch.spec_algorithm is NONE),
+                    # use tp_worker directly. Otherwise use model_worker (draft_worker).
+                    worker = (
+                        self.tp_worker
+                        if batch.spec_algorithm.is_none()
+                        else self.model_worker
+                    )
+                    batch_result = worker.forward_batch_generation(
                         model_worker_batch
                     )
                     # FIXME(lsyin): maybe move this to forward_batch_generation

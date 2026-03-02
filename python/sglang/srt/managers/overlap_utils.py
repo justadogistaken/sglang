@@ -45,7 +45,9 @@ class FutureMap:
         self.spec_algo = spec_algo
         self.buf_initialized = False
 
-        if self.spec_algo.is_none():
+        if self.spec_algo.is_none() or not self.spec_algo.is_eagle():
+            # For non-eagle algorithms (including NONE, NGRAM, SUFFIX),
+            # we need token_ids_buf for overlap scheduling
             self.token_ids_buf = torch.empty(
                 (self.future_buffer_len,), dtype=torch.int64, device=self.device
             )
