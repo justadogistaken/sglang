@@ -61,7 +61,8 @@ class SuffixCacheAdapter:
         self.min_token_prob = min_token_prob
 
         # Debug toggles (set env e.g. SUFFIX_DEBUG_TREE=1 to dump first batch)
-        self.debug_tree_dump_remaining = int(os.environ.get("SUFFIX_DEBUG_TREE", "0"))
+        self.debug_tree_dump_remaining = int(
+            os.environ.get("SUFFIX_DEBUG_TREE", "0"))
 
         # Track state by SGlang request ID (stable identifier)
         # Map: sglang_req_id → (arctic_req_id, last_length)
@@ -69,7 +70,7 @@ class SuffixCacheAdapter:
 
         # Preallocate buffers to avoid per-step allocations
         self.max_total_drafts = self.max_batch_size * self.draft_token_num
-        self.draft_buffer = np.empty((self.max_total_drafts,), dtype=np.int64)
+        self.draft_buffer = np.empty((self.max_total_drafts, ), dtype=np.int64)
         self.mask_buffer = np.empty(
             (self.max_batch_size, self.draft_token_num, self.draft_token_num),
             dtype=bool,
@@ -82,12 +83,13 @@ class SuffixCacheAdapter:
         ]
         for rid in inactive_req_ids:
             cache_req_id, _ = self.req_state.pop(rid)
-            if cache_req_id in getattr(self.suffix_cache, "active_requests", set()):
+            if cache_req_id in getattr(self.suffix_cache, "active_requests",
+                                       set()):
                 self.suffix_cache.stop_request(cache_req_id)
 
-    def _get_or_create_cache_req_id(
-        self, sglang_req_id: str, prompt: List[int], tokens: List[int]
-    ) -> tuple:
+    def _get_or_create_cache_req_id(self, sglang_req_id: str,
+                                    prompt: List[int],
+                                    tokens: List[int]) -> tuple:
         """Get or create a backend request ID for the given SGlang request.
 
         Args:
@@ -135,7 +137,7 @@ class SuffixCacheAdapter:
         """
         batch_size = len(batch_req_ids)
         if batch_size == 0:
-            return np.empty((0,), dtype=np.int64), np.empty((0,), dtype=bool)
+            return np.empty((0, ), dtype=np.int64), np.empty((0, ), dtype=bool)
 
         if batch_size > self.max_batch_size:
             raise ValueError(
@@ -151,18 +153,17 @@ class SuffixCacheAdapter:
         self._cleanup_inactive_requests(active_req_ids)
 
         for idx, (sglang_req_id, prompt, tokens) in enumerate(
-            zip(batch_req_ids, batch_prompts, batch_tokens)
-        ):
+                zip(batch_req_ids, batch_prompts, batch_tokens)):
             cache_req_id, last_length = self._get_or_create_cache_req_id(
-                sglang_req_id, prompt, tokens
-            )
+                sglang_req_id, prompt, tokens)
 
             # Ensure cache includes the latest verified tokens before speculation.
             current_length = len(tokens)
             if current_length > last_length:
                 new_tokens = tokens[last_length:current_length]
                 if cache_req_id in self.suffix_cache.active_requests:
-                    self.suffix_cache.add_active_response(cache_req_id, new_tokens)
+                    self.suffix_cache.add_active_response(
+                        cache_req_id, new_tokens)
                     self.req_state[sglang_req_id][1] = current_length
                     last_length = current_length
                 else:
@@ -186,12 +187,12 @@ class SuffixCacheAdapter:
             # Convert to fixed-size arrays
             draft_ids = list(draft.token_ids)
             draft_parents = list(draft.parents)
-            draft_ids, draft_parents = self._reorder_tree_bfs(draft_ids, draft_parents)
+            draft_ids, draft_parents = self._reorder_tree_bfs(
+                draft_ids, draft_parents)
 
             context_token = tokens[-1] if tokens else 0
             draft_ids, draft_parents = self._inject_root_node(
-                draft_ids, draft_parents, context_token
-            )
+                draft_ids, draft_parents, context_token)
 
             # Pad or truncate to match draft_token_num (includes root node at index 0)
             original_draft_len = len(draft_ids)
@@ -200,8 +201,8 @@ class SuffixCacheAdapter:
                 draft_ids.extend([0] * pad_len)
                 draft_parents.extend([0] * pad_len)
             elif original_draft_len > self.draft_token_num:
-                draft_ids = draft_ids[: self.draft_token_num]
-                draft_parents = draft_parents[: self.draft_token_num]
+                draft_ids = draft_ids[:self.draft_token_num]
+                draft_parents = draft_parents[:self.draft_token_num]
                 original_draft_len = self.draft_token_num
 
             start = idx * self.draft_token_num
@@ -233,7 +234,8 @@ class SuffixCacheAdapter:
                 )
                 self.debug_tree_dump_remaining -= 1
 
-        tree_mask = mask_view.reshape(-1)[: total_draft_tokens * self.draft_token_num]
+        tree_mask = mask_view.reshape(-1)[:total_draft_tokens *
+                                          self.draft_token_num]
 
         return draft_view, tree_mask
 
@@ -260,60 +262,61 @@ class SuffixCacheAdapter:
                           or spec disabled from start). If None, tokens are treated as
                           continuation of existing requests.
         """
+
+        return None
         # Cleanup requests that are no longer active in the current batch
         # This is important when speculative decoding is disabled, as batch_get won't be called
-        active_req_ids = set(batch_req_ids)
-        self._cleanup_inactive_requests(active_req_ids)
+        # active_req_ids = set(batch_req_ids)
+        # self._cleanup_inactive_requests(active_req_ids)
 
-        for idx, (sglang_req_id, tokens) in enumerate(
-            zip(batch_req_ids, batch_tokens)
-        ):
-            if not tokens:
-                continue
+        # for idx, (sglang_req_id, tokens) in enumerate(
+        #     zip(batch_req_ids, batch_tokens)
+        # ):
+        #     if not tokens:
+        #         continue
 
-            # Check if this request is already being tracked (normal spec flow)
-            if sglang_req_id in self.req_state:
-                cache_req_id, last_length = self.req_state[sglang_req_id]
-                current_length = len(tokens)
+        #     # Check if this request is already being tracked (normal spec flow)
+        #     if sglang_req_id in self.req_state:
+        #         cache_req_id, last_length = self.req_state[sglang_req_id]
+        #         current_length = len(tokens)
 
-                # If we have new tokens to add (normal spec flow)
-                if current_length > last_length:
-                    new_tokens = tokens[last_length:current_length]
-                    if cache_req_id in self.suffix_cache.active_requests:
-                        # Update via add_active_response for active requests (incremental update)
-                        self.suffix_cache.add_active_response(cache_req_id, new_tokens)
-                        self.req_state[sglang_req_id][1] = current_length
-                    else:
-                        # Request is not active anymore, need to re-add to cache
-                        # Use prompt if provided, otherwise use the tokens as both prompt and response
-                        if batch_prompts is not None and idx < len(batch_prompts):
-                            prompt = batch_prompts[idx]
-                            response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
-                        else:
-                            # Fallback: treat all tokens as prompt, no response
-                            prompt = tokens
-                            response = []
-                        
-                        self._add_completed_request_to_cache(
-                            sglang_req_id, prompt, response
-                        )
-                        self.req_state.pop(sglang_req_id, None)
-            else:
-                # Request not tracked (spec was disabled from start, or external update)
-                # Need prompt to properly add to cache
-                if batch_prompts is not None and idx < len(batch_prompts):
-                    prompt = batch_prompts[idx]
-                    response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
-                else:
-                    # Fallback: treat all tokens as prompt (less effective but still works)
-                    prompt = tokens
-                    response = []
-                
-                self._add_completed_request_to_cache(sglang_req_id, prompt, response)
+        #         # If we have new tokens to add (normal spec flow)
+        #         if current_length > last_length:
+        #             new_tokens = tokens[last_length:current_length]
+        #             if cache_req_id in self.suffix_cache.active_requests:
+        #                 # Update via add_active_response for active requests (incremental update)
+        #                 self.suffix_cache.add_active_response(cache_req_id, new_tokens)
+        #                 self.req_state[sglang_req_id][1] = current_length
+        #             else:
+        #                 # Request is not active anymore, need to re-add to cache
+        #                 # Use prompt if provided, otherwise use the tokens as both prompt and response
+        #                 if batch_prompts is not None and idx < len(batch_prompts):
+        #                     prompt = batch_prompts[idx]
+        #                     response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
+        #                 else:
+        #                     # Fallback: treat all tokens as prompt, no response
+        #                     prompt = tokens
+        #                     response = []
 
-    def _add_completed_request_to_cache(
-        self, req_id: str, prompt: List[int], response: List[int]
-    ):
+        #                 self._add_completed_request_to_cache(
+        #                     sglang_req_id, prompt, response
+        #                 )
+        #                 self.req_state.pop(sglang_req_id, None)
+        #     else:
+        #         # Request not tracked (spec was disabled from start, or external update)
+        #         # Need prompt to properly add to cache
+        #         if batch_prompts is not None and idx < len(batch_prompts):
+        #             prompt = batch_prompts[idx]
+        #             response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
+        #         else:
+        #             # Fallback: treat all tokens as prompt (less effective but still works)
+        #             prompt = tokens
+        #             response = []
+
+        #         self._add_completed_request_to_cache(sglang_req_id, prompt, response)
+
+    def _add_completed_request_to_cache(self, req_id: str, prompt: List[int],
+                                        response: List[int]):
         """
         Add a completed request's tokens to the global cache.
         
@@ -323,11 +326,11 @@ class SuffixCacheAdapter:
         try:
             # Start the request (adds prompt to local tree and allocates slot in global tree)
             self.suffix_cache.start_request(req_id, prompt)
-            
+
             # Add response tokens (updates both local and global tree)
             if response:
                 self.suffix_cache.add_active_response(req_id, response)
-            
+
             # Stop the request (removes from local tree, keeps in global tree)
             self.suffix_cache.stop_request(req_id)
         except ValueError as e:
@@ -345,7 +348,8 @@ class SuffixCacheAdapter:
                 try:
                     if req_id in self.suffix_cache.cached_requests:
                         self.suffix_cache.evict_cached_response(req_id)
-                    self._add_completed_request_to_cache(req_id, prompt, response)
+                    self._add_completed_request_to_cache(
+                        req_id, prompt, response)
                 except ValueError:
                     pass  # Ignore errors in retry
 
@@ -363,8 +367,8 @@ class SuffixCacheAdapter:
         logger.info("[SUFFIX ADAPTER] Cache reset")
 
     def _reorder_tree_bfs(
-        self, token_ids: List[int], parents: List[Optional[int]]
-    ) -> Tuple[List[int], List[int]]:
+            self, token_ids: List[int],
+            parents: List[Optional[int]]) -> Tuple[List[int], List[int]]:
         """
         Reorder nodes so parents always precede their descendants.
 
@@ -422,9 +426,8 @@ class SuffixCacheAdapter:
 
         return reordered_ids, reordered_parents
 
-    def _inject_root_node(
-        self, token_ids: List[int], parents: List[int], context_token: int
-    ) -> Tuple[List[int], List[int]]:
+    def _inject_root_node(self, token_ids: List[int], parents: List[int],
+                          context_token: int) -> Tuple[List[int], List[int]]:
         """
         Insert the latest verified token as index 0 so the layout matches NGRAM.
         """
