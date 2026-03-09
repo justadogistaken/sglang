@@ -1878,13 +1878,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # NOTE: reqs list is shallow-copied to avoid issues when the original batch
         # is filtered (finished requests are removed). We need to keep references to
         # all requests that were in the batch when it was copied.
+        # NOTE: out_cache_loc is cloned to avoid issues when the original batch
+        # is filtered and out_cache_loc is set to None.
         return ScheduleBatch(
             reqs=self.reqs.copy() if self.reqs else [],  # Shallow copy of the list
             req_to_token_pool=self.req_to_token_pool,
-            req_pool_indices=self.req_pool_indices,
+            req_pool_indices=self.req_pool_indices.clone() if self.req_pool_indices is not None else None,
             model_config=self.model_config,
             forward_mode=self.forward_mode,
-            out_cache_loc=self.out_cache_loc,
+            out_cache_loc=self.out_cache_loc.clone() if self.out_cache_loc is not None else None,
             return_logprob=self.return_logprob,
             decoding_reqs=self.decoding_reqs,
             spec_algorithm=self.spec_algorithm,
@@ -1893,7 +1895,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
-            seq_lens_cpu=self.seq_lens_cpu,
+            seq_lens_cpu=self.seq_lens_cpu.clone() if self.seq_lens_cpu is not None else None,
             enable_overlap=self.enable_overlap,
         )
 

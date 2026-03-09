@@ -319,13 +319,10 @@ class SchedulerOutputProcessorMixin:
             if batch.enable_overlap and (req.finished() or req.is_retracted):
                 # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
                 # (currently not, e.g. Eagle V1 still check finish during forward)
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
-                continue
-
-            # Extra safety check: skip if request is already finished
-            # This can happen when processing a queued batch from overlap mode
-            # after some requests have already been finished in a previous iteration
-            if req.finished():
+                # We need to release KV cache before continuing, otherwise it will cause memory leak.
+                if req.finished():
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
                 continue
 
             new_accepted_len = 1
