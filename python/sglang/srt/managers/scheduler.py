@@ -2071,8 +2071,20 @@ class Scheduler(
         if should_disable_spec:
             # Large batch: disable spec, enable overlap
             if not batch.spec_algorithm.is_none():
-                # Transitioning from spec to non-spec
-                # Clear spec_info to avoid issues in prepare_for_decode
+                # Transitioning from spec to non-spec.
+                # After spec verify, batch.output_ids is set to verified_id: a flat tensor with
+                # sum(accept_lengths + 1) elements (multi-token). prepare_for_decode() would do
+                # input_ids = output_ids, which would have more elements than out_cache_loc slots
+                # (1 per req), causing a shape mismatch in set_kv_buffer.
+                # Reset output_ids to 1 token per request (the last accepted token for each req).
+                batch.output_ids = torch.tensor(
+                    [
+                        req.output_ids[-1] if req.output_ids else req.origin_input_ids[-1]
+                        for req in batch.reqs
+                    ],
+                    dtype=torch.int64,
+                    device=batch.device,
+                )
                 batch.spec_info = None
                 batch.spec_algorithm = SpeculativeAlgorithm.NONE
             batch.enable_overlap = self.enable_overlap

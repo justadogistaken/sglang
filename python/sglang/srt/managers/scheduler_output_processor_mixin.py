@@ -315,12 +315,16 @@ class SchedulerOutputProcessorMixin:
                 # 1. Overlap scheduling: the previous batch's result is processed
                 #    (pop_and_process) AFTER get_next_batch_to_run(), so requests
                 #    marked finished by pop_and_process are still in the current batch.
-                # 2. Dynamic spec/non-spec switching: same ordering issue applies
-                #    even when batch.enable_overlap=False.
-                # In both cases the request was already fully processed (KV released,
-                # output_ids updated, completion_time set) in its first
-                # process_batch_result_decode call. Do NOT call release_kv_cache again —
-                # pop_overallocated_kv_cache() asserts against double-free.
+                #    In this case release_kv_cache was already called → kv_overallocated_freed=True.
+                #    Do NOT call it again (pop_overallocated_kv_cache asserts against double-free).
+                # 2. Spec decoding: request finished inside _fill_requests (ngram/suffix verify)
+                #    which updates req.output_ids and calls req.check_finished() before
+                #    process_batch_result_decode runs. In this case release_kv_cache was NOT
+                #    called yet → kv_overallocated_freed=False. We MUST call it now to avoid
+                #    KV cache leak (protected_size stays non-zero + tokens unaccounted for).
+                if req.finished() and not req.kv_overallocated_freed:
+                    release_kv_cache(req, self.tree_cache)
+                    req.time_stats.completion_time = time.perf_counter()
                 continue
 
             new_accepted_len = 1
