@@ -1067,6 +1067,19 @@ class Scheduler(
                 elif self.last_batch is not None:
                     pop_and_process()
 
+                # After pop_and_process, some requests may have been newly marked as
+                # finished (their KV cache + req_pool_idx already freed by release_kv_cache).
+                # For non-overlap (spec) batches, re-filter NOW before run_batch so that
+                # _prepare_for_speculative_decoding never writes to a freed req_pool_idx
+                # (which could be reallocated to a new request → data corruption + KV leak).
+                # Safe for spec batches because prepare_for_decode() returned early and
+                # no out_cache_loc slots were allocated for the current iteration yet.
+                if batch is not None and not batch.enable_overlap:
+                    batch.filter_batch()
+                    if batch.is_empty():
+                        batch = None
+                    self.cur_batch = batch
+
             batch_result = None
             if batch:
                 batch_result = self.run_batch(batch)
