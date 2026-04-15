@@ -5,7 +5,9 @@ This is a thin wrapper that replaces NgramCache with SuffixCacheAdapter,
 allowing all the tree-based verification logic to be reused.
 """
 
+import json
 import logging
+import os
 from typing import Optional
 
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -14,6 +16,60 @@ from sglang.srt.speculative.ngram_worker import NGRAMWorker
 from sglang.srt.speculative.suffix_cache_adapter import SuffixCacheAdapter
 
 logger = logging.getLogger(__name__)
+
+
+class SpecStatsLogger:
+    """
+    Writes per-step, per-request speculative decoding stats to a JSONL file.
+
+    Enable by setting the SUFFIX_STATS_FILE environment variable:
+        SUFFIX_STATS_FILE=/tmp/spec_stats.jsonl
+
+    Each line is a JSON object:
+        {
+          "step": int,          # global decode-step counter
+          "req_id": str,        # SGLang request ID
+          "draft_score": float, # sum of per-token suffix-cache probs (draft quality proxy)
+          "match_len": int,     # context suffix matched in the cache (longer = better)
+          "draft_len": int,     # actual draft tokens proposed (excl. padding)
+          "accept_len": int,    # tokens accepted by target model (incl. bonus token)
+          "accept_rate": float  # accept_len / (draft_len - 1), or 0 if draft_len <= 1
+        }
+    """
+
+    def __init__(self):
+        self._file = None
+        self._step = 0
+        output_path = os.environ.get("SUFFIX_STATS_FILE", "")
+        if output_path:
+            self._file = open(output_path, "w", buffering=1)
+            logger.info("[SpecStatsLogger] Writing spec stats to %s", output_path)
+
+    @property
+    def enabled(self):
+        return self._file is not None
+
+    def log(self, req_ids, draft_stats, accept_lengths):
+        if not self.enabled:
+            return
+        for rid, stats, accept_len in zip(req_ids, draft_stats, accept_lengths):
+            usable_drafts = stats["draft_len"] - 1  # exclude root node
+            record = {
+                "step": self._step,
+                "req_id": rid,
+                "draft_score": round(stats["score"], 4),
+                "match_len": stats["match_len"],
+                "draft_len": stats["draft_len"],
+                "accept_len": int(accept_len),
+                "accept_rate": round(int(accept_len) / usable_drafts, 4) if usable_drafts > 0 else 0.0,
+            }
+            self._file.write(json.dumps(record) + "\n")
+        self._step += 1
+
+    def close(self):
+        if self._file:
+            self._file.close()
+            self._file = None
 
 
 class SuffixWorker(NGRAMWorker):
@@ -53,6 +109,7 @@ class SuffixWorker(NGRAMWorker):
             max_spec_factor=server_args.speculative_suffix_max_spec_factor,
             min_token_prob=server_args.speculative_suffix_min_token_prob,
         )
+        self._stats_logger = SpecStatsLogger()
 
     def _prepare_draft_tokens(self, batch):
         """
@@ -113,3 +170,32 @@ class SuffixWorker(NGRAMWorker):
             batch_tokens.append(full_tokens)
 
         self.ngram_cache.batch_put(batch_req_ids, batch_tokens, batch_prompts)
+
+    def forward_batch_generation(self, batch):
+        """
+        Override to capture draft stats vs accept lengths for correlation logging.
+        Only active when SUFFIX_STATS_FILE env var is set.
+        """
+        # Snapshot req_ids and check if spec verify will run this step.
+        # Spec verify runs when: not extend mode AND spec_algorithm is not NONE.
+        will_run_spec = (
+            self._stats_logger.enabled
+            and not batch.forward_mode.is_extend()
+            and not batch.spec_algorithm.is_none()
+        )
+        req_ids_snapshot = [req.rid for req in batch.reqs] if will_run_spec else None
+
+        result = super().forward_batch_generation(batch)
+
+        if will_run_spec and req_ids_snapshot:
+            spec_info = batch.spec_info
+            draft_stats = self.ngram_cache._last_draft_stats
+            if (
+                spec_info is not None
+                and hasattr(spec_info, "accept_length")
+                and draft_stats
+            ):
+                accept_lengths = spec_info.accept_length.tolist()
+                self._stats_logger.log(req_ids_snapshot, draft_stats, accept_lengths)
+
+        return result

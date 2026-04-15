@@ -76,6 +76,11 @@ class SuffixCacheAdapter:
             dtype=bool,
         )
 
+        # Per-step draft stats populated by batch_get(), read by SuffixWorker
+        # after verify() to correlate draft quality with accept rate.
+        # Each entry: {"score": float, "match_len": int, "draft_len": int}
+        self._last_draft_stats: list = []
+
     def _cleanup_inactive_requests(self, active_req_ids: set[str]):
         """Stop backend requests that are no longer active in SGlang."""
         inactive_req_ids = [
@@ -136,6 +141,8 @@ class SuffixCacheAdapter:
             - tree_mask: np.ndarray of shape (batch_size * draft_token_num * draft_token_num,)
         """
         batch_size = len(batch_req_ids)
+        self._last_draft_stats = []  # reset each step
+
         if batch_size == 0:
             return np.empty((0, ), dtype=np.int64), np.empty((0, ), dtype=bool)
 
@@ -204,6 +211,12 @@ class SuffixCacheAdapter:
                 draft_ids = draft_ids[:self.draft_token_num]
                 draft_parents = draft_parents[:self.draft_token_num]
                 original_draft_len = self.draft_token_num
+
+            self._last_draft_stats.append({
+                "score": draft.score,
+                "match_len": draft.match_len,
+                "draft_len": original_draft_len,
+            })
 
             start = idx * self.draft_token_num
             end = start + self.draft_token_num
