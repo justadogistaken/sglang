@@ -380,7 +380,8 @@ def plot_all(df: pd.DataFrame, output_dir: Path):
     if "first_token_prob" in df.columns:
         pivot = df.copy()
         pivot["ftp_q"] = pd.qcut(df["first_token_prob"], q=4,
-                                  labels=["Q1 low","Q2","Q3","Q4 high"])
+                                  labels=["Q1 low","Q2","Q3","Q4 high"],
+                                  duplicates="drop")
         for q_label, grp2 in pivot.groupby("ftp_q", observed=True):
             ml_grp = grp2.groupby("ml_bin", observed=True)["accept_rate"].mean()
             mids2  = [(iv.left + iv.right) / 2 for iv in ml_grp.index]
