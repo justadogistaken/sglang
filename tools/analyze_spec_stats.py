@@ -278,9 +278,9 @@ def plot_all(df: pd.DataFrame, output_dir: Path):
     bins = np.linspace(0, 1, 21)
     df["ftp_bin"] = pd.cut(df["first_token_prob"], bins)
     grp = df.groupby("ftp_bin", observed=True)
-    mids = [(iv.left + iv.right) / 2 for iv in grp["accept_rate"].mean().index]
+    mids    = [(iv.left + iv.right) / 2 for iv in grp["accept_rate"].mean().index]
     mean_ar = grp["accept_rate"].mean().values
-    zero_r  = (grp["accept_rate"] == 0).mean().values
+    zero_r  = grp["accept_rate"].apply(lambda x: (x == 0).mean()).values
     counts  = grp["accept_rate"].count().values
 
     ax = axes[0]
