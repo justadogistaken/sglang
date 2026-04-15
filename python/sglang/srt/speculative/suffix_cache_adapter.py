@@ -216,6 +216,10 @@ class SuffixCacheAdapter:
                 "score": draft.score,
                 "match_len": draft.match_len,
                 "draft_len": original_draft_len,
+                # probs[i] = suffix-cache frequency of draft position i+1 (root excluded).
+                # In path mode (use_tree_spec=False, current default) the order is linear
+                # and maps directly to draft positions 1..N after _inject_root_node.
+                "probs": list(draft.probs),
             })
 
             start = idx * self.draft_token_num

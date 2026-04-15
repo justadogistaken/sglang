@@ -27,14 +27,20 @@ class SpecStatsLogger:
 
     Each line is a JSON object:
         {
-          "step": int,          # global decode-step counter
-          "req_id": str,        # SGLang request ID
-          "draft_score": float, # sum of per-token suffix-cache probs (draft quality proxy)
-          "match_len": int,     # context suffix matched in the cache (longer = better)
-          "draft_len": int,     # actual draft tokens proposed (excl. padding)
-          "accept_len": int,    # tokens accepted by target model (incl. bonus token)
-          "accept_rate": float  # accept_len / (draft_len - 1), or 0 if draft_len <= 1
+          "step": int,              # global decode-step counter
+          "req_id": str,            # SGLang request ID
+          "draft_score": float,     # sum of per-token suffix-cache probs (can exceed 1)
+          "draft_score_avg": float, # draft_score / usable_drafts, mean per-token prob in [0,1]
+          "first_token_prob": float,# probs[0], frequency of the first draft token in cache
+          "probs": List[float],     # per-position cache frequency for draft positions 1..8
+          "match_len": int,         # context suffix matched in the cache (longer = better)
+          "draft_len": int,         # actual draft tokens proposed (excl. padding)
+          "accept_len": int,        # tokens accepted by target model (incl. bonus token)
+          "accept_rate": float      # accept_len / (draft_len - 1), or 0 if draft_len <= 1
         }
+
+    Note: probs[i] is the suffix-cache frequency (NOT the target model probability).
+    In path mode (default), probs[i] maps directly to draft position i+1 (root excluded).
     """
 
     def __init__(self):
@@ -54,10 +60,14 @@ class SpecStatsLogger:
             return
         for rid, stats, accept_len in zip(req_ids, draft_stats, accept_lengths):
             usable_drafts = stats["draft_len"] - 1  # exclude root node
+            probs = stats["probs"]
             record = {
                 "step": self._step,
                 "req_id": rid,
-                "draft_score": round(stats["score"], 4),
+                "draft_score": round(stats["score"], 4),       # sum(probs), can exceed 1
+                "draft_score_avg": round(stats["score"] / usable_drafts, 4) if usable_drafts > 0 else 0.0,  # mean per-token prob, in [0,1]
+                "first_token_prob": round(probs[0], 4) if probs else 0.0,
+                "probs": [round(p, 4) for p in probs[:8]],     # draft positions 1..8
                 "match_len": stats["match_len"],
                 "draft_len": stats["draft_len"],
                 "accept_len": int(accept_len),
