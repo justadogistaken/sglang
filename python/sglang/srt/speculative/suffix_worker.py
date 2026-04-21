@@ -14,6 +14,7 @@ from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
 from sglang.srt.speculative.suffix_cache_adapter import SuffixCacheAdapter
+from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +210,6 @@ class SuffixWorker(NGRAMWorker):
                 self._stats_logger.log(req_ids_snapshot, draft_stats, accept_lengths)
 
         return result
+
+    def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        return True, "Success"
