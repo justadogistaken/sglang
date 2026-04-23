@@ -212,4 +212,4 @@ class SuffixWorker(NGRAMWorker):
         return result
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        return True, "Success"
+        return self.target_worker.update_weights_from_tensor(recv_req)
