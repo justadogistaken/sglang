@@ -159,6 +159,18 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
+from sglang.srt.speculative.decoupled_spec_io import (
+    DraftClose,
+    DraftControlBatch,
+    DraftReqKey,
+    DraftSync,
+    RequestTerminateReason,
+    VerifyCommit,
+)
+from sglang.srt.speculative.decoupled_spec_trace import build_decoupled_spec_tracer
+from sglang.srt.speculative.draft_adapter import DraftAdapterThread
+from sglang.srt.speculative.draft_proxy import DraftProxyThread
+from sglang.srt.speculative.draft_tail_buffer import DraftTailBuffer, DraftTailSnapshot
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.tracing.trace import (
     process_tracing_init,
@@ -271,6 +283,15 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        if self.spec_algorithm.is_decoupled_draft():
+            if self.enable_overlap:
+                raise ValueError(
+                    "decoupled drafter does not support overlap scheduler."
+                )
+            if not server_args.disable_radix_cache:
+                raise ValueError(
+                    "decoupled drafter requires radix cache to be disabled."
+                )
         self.gpu_id = gpu_id
         self.page_size = server_args.page_size
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
@@ -292,6 +313,21 @@ class Scheduler(
 
         # Init diffusion LLM config
         self.dllm_config = DllmConfig.from_server_args(server_args)
+
+        # Init decoupled spec tracer and draft tail buffer (before init_sockets)
+        self.decoupled_spec_tracer = self._init_decoupled_spec_tracer(server_args)
+        self.draft_tail_buffer = (
+            DraftTailBuffer(
+                verifier_rank=self.dp_rank or 0,
+                required_tail_len=max(
+                    0, int(server_args.speculative_num_draft_tokens) - 1
+                ),
+                enable_debug_prints=False,
+            )
+            if self._is_decoupled_verify_entry_rank()
+            else None
+        )
+        self.port_args = port_args  # save for use in init_running_status
 
         # Init inter-process communication
         self.init_sockets(server_args, port_args)
@@ -353,7 +389,7 @@ class Scheduler(
         )
 
         # Dispatch the model worker
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             self.model_worker = self.tp_worker
         else:
             self.model_worker = self.draft_worker
@@ -459,6 +495,44 @@ class Scheduler(
         self.forward_sleep_time = None
         self._engine_paused = False
 
+        # Init decoupled speculative decoding state
+        self.draft_adapter_thread = None
+        if self._is_decoupled_draft_entry_rank():
+            ipc_config = self.port_args.draft_mesh_ipc_config
+            if ipc_config is None:
+                raise RuntimeError(
+                    "Draft mesh IPC config is required on decoupled_draft entry rank"
+                )
+            self.draft_adapter_thread = DraftAdapterThread(
+                context=getattr(self, "zmq_context", None),
+                ipc_config=ipc_config,
+                drafter_rank=self.dp_rank or 0,
+                tracer=self.decoupled_spec_tracer,
+            )
+        if self.draft_adapter_thread is not None:
+            self.draft_adapter_thread.start()
+        # (src_verifier_rank, request_id) -> Req
+        self.draft_req_table: Dict[DraftReqKey, Req] = {}
+        self.decoupled_verify_drafter_ranks: list[int] = []
+        self.decoupled_verify_req_to_drafter_rank: Dict[str, int] = {}
+        self.decoupled_verify_drafter_loads: Dict[int, int] = {}
+        if self._is_decoupled_verify_entry_rank():
+            ipc_config = self.port_args.draft_mesh_ipc_config
+            if ipc_config is None:
+                raise RuntimeError(
+                    "Draft mesh IPC config is required on decoupled_verify entry rank"
+                )
+            self.decoupled_verify_drafter_ranks = sorted(
+                int(rank) for rank in ipc_config.control_endpoints.keys()
+            )
+            if not self.decoupled_verify_drafter_ranks:
+                raise RuntimeError(
+                    "Decoupled verify requires at least one drafter control endpoint"
+                )
+            self.decoupled_verify_drafter_loads = {
+                rank: 0 for rank in self.decoupled_verify_drafter_ranks
+            }
+
         # Init chunked prefill
         self.chunked_prefill_size = server_args.chunked_prefill_size
         if self.dllm_config is not None:
@@ -499,6 +573,12 @@ class Scheduler(
             * server_args.schedule_conservativeness,
             1.0,
         )
+        if (
+            self.spec_algorithm.is_decoupled_verify()
+            or self.spec_algorithm.is_decoupled_draft()
+        ):
+            # For decoupled spec, enqueue as many requests as possible.
+            self.init_new_token_ratio = 0.0
         self.min_new_token_ratio = min(
             self.init_new_token_ratio * envs.SGLANG_MIN_NEW_TOKEN_RATIO_FACTOR.get(),
             1.0,
@@ -594,8 +674,11 @@ class Scheduler(
         )
 
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
+        self.port_args = port_args
         context = zmq.Context(2)
+        self.zmq_context = context
         self.idle_sleeper = None
+        self.draft_proxy_thread = None
 
         class SenderWrapper:
             def __init__(self, socket: zmq.Socket):
@@ -644,6 +727,25 @@ class Scheduler(
             self.send_to_tokenizer = SenderWrapper(send_to_tokenizer)
             self.send_to_detokenizer = SenderWrapper(send_to_detokenizer)
 
+            if self.spec_algorithm.is_decoupled_verify():
+                ipc_config = port_args.draft_mesh_ipc_config
+                if ipc_config is None:
+                    raise RuntimeError(
+                        "Draft mesh IPC config is required on decoupled_verify entry rank"
+                    )
+                if self.draft_tail_buffer is None:
+                    raise RuntimeError(
+                        "DraftTailBuffer is required on decoupled_verify entry rank"
+                    )
+                self.draft_proxy_thread = DraftProxyThread(
+                    context=context,
+                    ipc_config=ipc_config,
+                    verifier_rank=self.dp_rank or 0,
+                    draft_tail_buffer=self.draft_tail_buffer,
+                    tracer=self.decoupled_spec_tracer,
+                )
+                self.draft_proxy_thread.start()
+
             if self.server_args.sleep_on_idle:
                 self.idle_sleeper = IdleSleeper(
                     [
@@ -682,6 +784,8 @@ class Scheduler(
     def init_tokenizer(self):
         server_args = self.server_args
         self.is_generation = self.model_config.is_generation
+        if self.spec_algorithm.is_decoupled_verify() and not self.is_generation:
+            raise ValueError("decoupled_verify only supports generation models.")
 
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -711,6 +815,422 @@ class Scheduler(
             self.tokenizer.think_end_id = self.tokenizer.encode(
                 reasoning_parser.detector.think_end_token, add_special_tokens=False
             )[0]
+
+    # -----------------------------------------------------------------------
+    # Decoupled speculative decoding helpers
+    # -----------------------------------------------------------------------
+
+    def _init_decoupled_spec_tracer(self, server_args: ServerArgs):
+        enabled = bool(
+            getattr(server_args, "enable_decoupled_spec_trace", False)
+            and (
+                self.spec_algorithm.is_decoupled_verify()
+                or self.spec_algorithm.is_decoupled_draft()
+            )
+        )
+        dp_rank = self.dp_rank or 0
+        file_names = {
+            "verifier": f"verifier_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv",
+            "drafter": f"drafter_dp{dp_rank}_tp{self.tp_rank}_pp{self.pp_rank}.csv",
+            "draft_proxy": f"draft_proxy_verifier{dp_rank}.csv",
+            "draft_adapter": f"draft_adapter_drafter{dp_rank}.csv",
+        }
+        return build_decoupled_spec_tracer(
+            enabled=enabled,
+            output_dir=getattr(server_args, "decoupled_spec_trace_dir", None),
+            file_names=file_names,
+        )
+
+    def _decoupled_spec_trace_enabled(self) -> bool:
+        return bool(getattr(self.decoupled_spec_tracer, "enabled", False))
+
+    def _decoupled_spec_trace_component(self) -> Optional[str]:
+        if self.spec_algorithm.is_decoupled_verify():
+            return "verifier"
+        if self.spec_algorithm.is_decoupled_draft():
+            return "drafter"
+        return None
+
+    def _decoupled_spec_trace_sync_device(self) -> None:
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def _record_decoupled_forward_trace(
+        self,
+        batch: "ScheduleBatch",
+        *,
+        duration_ms: float,
+    ) -> None:
+        if not self._decoupled_spec_trace_enabled():
+            return
+        component = self._decoupled_spec_trace_component()
+        if component is None:
+            return
+        self.decoupled_spec_tracer.record(
+            component,
+            "forward_batch",
+            duration_ms=duration_ms,
+            forward_mode=str(batch.forward_mode),
+            batch_size=len(batch.reqs),
+            request_ids=[req.rid for req in batch.reqs],
+            committed_lens_by_req=[
+                int(getattr(req, "verifier_committed_prefix_len", 0))
+                for req in batch.reqs
+            ],
+            output_lens_by_req=[len(req.output_ids) for req in batch.reqs],
+        )
+
+    def _is_decoupled_verify_entry_rank(self) -> bool:
+        return (
+            self.spec_algorithm.is_decoupled_verify()
+            and self.pp_rank == 0
+            and self.attn_tp_rank == 0
+        )
+
+    def _assign_decoupled_drafter_rank_for_request(self, request_id: str) -> int:
+        """Assign a verifier request to the currently least-loaded drafter rank."""
+        drafter_rank = self.decoupled_verify_req_to_drafter_rank.get(request_id)
+        if drafter_rank is not None:
+            return drafter_rank
+
+        if not self.decoupled_verify_drafter_ranks:
+            raise RuntimeError(
+                "Decoupled verify drafter ranks are not initialized on entry rank"
+            )
+        drafter_rank = min(
+            self.decoupled_verify_drafter_ranks,
+            key=lambda rank: (self.decoupled_verify_drafter_loads.get(rank, 0), rank),
+        )
+        self.decoupled_verify_req_to_drafter_rank[request_id] = drafter_rank
+        self.decoupled_verify_drafter_loads[drafter_rank] = (
+            self.decoupled_verify_drafter_loads.get(drafter_rank, 0) + 1
+        )
+        return drafter_rank
+
+    def _get_decoupled_drafter_rank_for_request(self, request_id: str) -> int:
+        """Return the drafter rank already assigned to a verifier request."""
+        drafter_rank = self.decoupled_verify_req_to_drafter_rank.get(request_id)
+        if drafter_rank is None:
+            raise RuntimeError(
+                "Missing decoupled verify drafter assignment for "
+                f"request_id={request_id}"
+            )
+        return drafter_rank
+
+    def _release_decoupled_drafter_rank_for_request(self, request_id: str) -> None:
+        """Release one request's drafter assignment after close/abort."""
+        drafter_rank = self.decoupled_verify_req_to_drafter_rank.pop(request_id, None)
+        if drafter_rank is None:
+            return
+        self.decoupled_verify_drafter_loads[drafter_rank] = max(
+            0,
+            self.decoupled_verify_drafter_loads.get(drafter_rank, 0) - 1,
+        )
+
+    def _submit_decoupled_verify_control_batch(self, batch: DraftControlBatch) -> None:
+        if not self._is_decoupled_verify_entry_rank():
+            return
+        if self.draft_proxy_thread is None:
+            raise RuntimeError(
+                "Draft proxy thread is not initialized on decoupled_verify entry rank"
+            )
+        self.draft_proxy_thread.submit_control_batch(batch)
+
+    def _send_decoupled_verify_control_batches(
+        self,
+        *,
+        sync_messages: Optional[List[DraftSync]] = None,
+        verify_commit_messages: Optional[List[VerifyCommit]] = None,
+        close_messages: Optional[List[DraftClose]] = None,
+    ) -> None:
+        if not self._is_decoupled_verify_entry_rank():
+            return
+
+        batches: Dict[int, DraftControlBatch] = {}
+
+        def get_batch(dst_drafter_rank: int) -> DraftControlBatch:
+            dst_drafter_rank = int(dst_drafter_rank)
+            b = batches.get(dst_drafter_rank)
+            if b is None:
+                b = DraftControlBatch(dst_drafter_rank=dst_drafter_rank)
+                batches[dst_drafter_rank] = b
+            return b
+
+        for message in sync_messages or []:
+            get_batch(message.dst_drafter_rank).sync_messages.append(message)
+        for message in verify_commit_messages or []:
+            get_batch(message.dst_drafter_rank).verify_commit_messages.append(message)
+        for message in close_messages or []:
+            get_batch(message.dst_drafter_rank).close_messages.append(message)
+
+        for b in batches.values():
+            self._submit_decoupled_verify_control_batch(b)
+
+    def _broadcast_decoupled_verify_snapshots(
+        self, local_snapshots: Optional[List[DraftTailSnapshot]]
+    ) -> List[DraftTailSnapshot]:
+        source_payload = (
+            list(local_snapshots or [])
+            if self._is_decoupled_verify_entry_rank()
+            else []
+        )
+        if self.tp_size != 1:
+            source_payload = broadcast_pyobj(
+                source_payload,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        return list(source_payload or [])
+
+    def _bind_decoupled_verify_snapshots(
+        self,
+        target_reqs: List["Req"],
+        snapshots: List[DraftTailSnapshot],
+    ) -> None:
+        snapshot_by_rid: Dict[str, DraftTailSnapshot] = {}
+        for snapshot in snapshots:
+            if snapshot.request_id in snapshot_by_rid:
+                raise RuntimeError(
+                    "Duplicate decoupled verify draft tail snapshot: "
+                    f"request_id={snapshot.request_id}"
+                )
+            snapshot_by_rid[snapshot.request_id] = snapshot
+
+        for req in target_reqs:
+            snapshot = snapshot_by_rid.get(req.rid)
+            if snapshot is None:
+                setattr(req, "draft_buffer", None)
+                continue
+            committed_len = int(snapshot.committed_len)
+            if committed_len != len(req.output_ids):
+                raise RuntimeError(
+                    "Decoupled verify draft tail snapshot is out of sync with "
+                    "the verifier request: "
+                    f"request_id={req.rid} snapshot_committed_len={committed_len} "
+                    f"request_output_len={len(req.output_ids)}"
+                )
+            setattr(req, "draft_buffer", list(snapshot.tail_tokens))
+
+    def _before_process_batch_decoupled_verify(self, batch: "ScheduleBatch") -> None:
+        """Send DraftSync messages before verifier extend processing."""
+        if not self._is_decoupled_verify_entry_rank():
+            return
+        if not batch.forward_mode.is_extend() or batch.is_dllm():
+            return
+
+        draft_tail_buffer = self.draft_tail_buffer
+        assert draft_tail_buffer is not None
+
+        sync_messages: List[DraftSync] = []
+        for req in batch.reqs:
+            if not req.is_retracted and not req.finished():
+                setattr(
+                    req,
+                    "_decoupled_verify_pre_committed_len",
+                    len(req.output_ids),
+                )
+            if req.is_chunked > 0 or req.is_retracted or req.finished():
+                continue
+            if draft_tail_buffer.has_request(req.rid):
+                continue
+            sync_messages.append(
+                DraftSync(
+                    request_id=req.rid,
+                    src_verifier_rank=self.dp_rank or 0,
+                    dst_drafter_rank=self._assign_decoupled_drafter_rank_for_request(
+                        req.rid
+                    ),
+                    prompt_token_ids=list(req.origin_input_ids),
+                    committed_output_ids=list(req.output_ids),
+                )
+            )
+            setattr(req, "draft_buffer", None)
+        if self._decoupled_spec_trace_enabled():
+            self.decoupled_spec_tracer.record(
+                "verifier",
+                "build_sync_batch",
+                forward_mode=str(batch.forward_mode),
+                batch_size=len(batch.reqs),
+                num_sync=len(sync_messages),
+                request_ids=[m.request_id for m in sync_messages],
+                committed_lens_by_req=[
+                    len(m.committed_output_ids) for m in sync_messages
+                ],
+                output_lens_by_req=[len(m.committed_output_ids) for m in sync_messages],
+                dst_drafter_ranks=[int(m.dst_drafter_rank) for m in sync_messages],
+            )
+        self._send_decoupled_verify_control_batches(sync_messages=sync_messages)
+
+    def _prepare_decoupled_verify_batch(self, batch: "ScheduleBatch") -> None:
+        """Collect draft tails and bind to verifier requests before decode forward."""
+        live_reqs = []
+        for req in batch.reqs:
+            if req.is_retracted or req.finished():
+                continue
+            live_reqs.append(req)
+            setattr(req, "draft_buffer", None)
+            setattr(req, "_decoupled_verify_pre_committed_len", len(req.output_ids))
+        if not live_reqs:
+            return
+
+        local_snapshots: List[DraftTailSnapshot] = []
+        if self._is_decoupled_verify_entry_rank():
+            draft_tail_buffer = self.draft_tail_buffer
+            assert draft_tail_buffer is not None
+            local_snapshots = draft_tail_buffer.get_draft_snapshots(
+                live_reqs,
+                allow_partial=True,
+            )
+
+        synced_snapshots = self._broadcast_decoupled_verify_snapshots(local_snapshots)
+        self._bind_decoupled_verify_snapshots(live_reqs, synced_snapshots)
+        if self._decoupled_spec_trace_enabled():
+            self.decoupled_spec_tracer.record(
+                "verifier",
+                "snapshot_tail_batch",
+                forward_mode=str(batch.forward_mode),
+                batch_size=len(live_reqs),
+                request_ids=[req.rid for req in live_reqs],
+                draft_token_lens_by_req=[
+                    len(getattr(req, "draft_buffer", None) or []) for req in live_reqs
+                ],
+                committed_lens_by_req=[len(req.output_ids) for req in live_reqs],
+                output_lens_by_req=[len(req.output_ids) for req in live_reqs],
+            )
+
+    def _after_process_batch_decoupled_verify(self, batch: "ScheduleBatch") -> None:
+        """Send VerifyCommit/DraftClose messages after batch result processing."""
+        if not self._is_decoupled_verify_entry_rank():
+            return
+        if batch.forward_mode.is_extend() and batch.is_dllm():
+            return
+        if not (batch.forward_mode.is_extend() or batch.forward_mode.is_decode()):
+            return
+
+        draft_tail_buffer = self.draft_tail_buffer
+        assert draft_tail_buffer is not None
+
+        verify_commit_messages: List[VerifyCommit] = []
+        close_messages: List[DraftClose] = []
+        commit_accepted_tail_lens: List[int] = []
+        commit_output_lens: List[int] = []
+        close_output_lens: List[int] = []
+
+        for req in batch.reqs:
+            has_request = draft_tail_buffer.has_request(req.rid)
+
+            if req.is_retracted or req.finished():
+                terminate_reason = (
+                    RequestTerminateReason.ABORT
+                    if req.is_retracted
+                    else RequestTerminateReason.FINISHED
+                )
+                if has_request:
+                    dst_drafter_rank = self._get_decoupled_drafter_rank_for_request(
+                        req.rid
+                    )
+                    close_messages.append(
+                        DraftClose(
+                            request_id=req.rid,
+                            src_verifier_rank=self.dp_rank or 0,
+                            dst_drafter_rank=dst_drafter_rank,
+                            reason=terminate_reason,
+                        )
+                    )
+                    close_output_lens.append(len(req.output_ids))
+                    self._release_decoupled_drafter_rank_for_request(req.rid)
+                setattr(req, "draft_buffer", None)
+                continue
+
+            if not has_request:
+                continue
+            if not req.output_ids:
+                continue
+
+            bonus_token_pos = len(req.output_ids) - 1
+            pre_verify_committed_len = getattr(
+                req, "_decoupled_verify_pre_committed_len", None
+            )
+            if pre_verify_committed_len is None:
+                pre_verify_committed_len = draft_tail_buffer.get_committed_len(req.rid)
+            if pre_verify_committed_len is None:
+                continue
+
+            verify_commit_messages.append(
+                VerifyCommit(
+                    request_id=req.rid,
+                    src_verifier_rank=self.dp_rank or 0,
+                    dst_drafter_rank=self._get_decoupled_drafter_rank_for_request(
+                        req.rid
+                    ),
+                    pre_verify_committed_len=pre_verify_committed_len,
+                    bonus_token_pos=bonus_token_pos,
+                    bonus_token_id=int(req.output_ids[bonus_token_pos]),
+                )
+            )
+            commit_accepted_tail_lens.append(
+                int(bonus_token_pos) - int(pre_verify_committed_len)
+            )
+            commit_output_lens.append(len(req.output_ids))
+            if hasattr(req, "_decoupled_verify_pre_committed_len"):
+                delattr(req, "_decoupled_verify_pre_committed_len")
+
+        if self._decoupled_spec_trace_enabled():
+            self.decoupled_spec_tracer.record(
+                "verifier",
+                "build_commit_batch",
+                forward_mode=str(batch.forward_mode),
+                batch_size=len(batch.reqs),
+                num_commit=len(verify_commit_messages),
+                request_ids=[m.request_id for m in verify_commit_messages],
+                accepted_tail_lens_by_req=commit_accepted_tail_lens,
+                committed_lens_by_req=[
+                    int(m.bonus_token_pos) + 1 for m in verify_commit_messages
+                ],
+                output_lens_by_req=commit_output_lens,
+                dst_drafter_ranks=[
+                    int(m.dst_drafter_rank) for m in verify_commit_messages
+                ],
+            )
+            self.decoupled_spec_tracer.record(
+                "verifier",
+                "build_close_batch",
+                forward_mode=str(batch.forward_mode),
+                batch_size=len(batch.reqs),
+                num_close=len(close_messages),
+                request_ids=[m.request_id for m in close_messages],
+                output_lens_by_req=close_output_lens,
+                dst_drafter_ranks=[int(m.dst_drafter_rank) for m in close_messages],
+            )
+        self._send_decoupled_verify_control_batches(
+            verify_commit_messages=verify_commit_messages,
+            close_messages=close_messages,
+        )
+
+    def _maybe_abort_decoupled_verify_request(self, request_id: str) -> None:
+        """Close drafter-side state when verifier aborts a request."""
+        if not self._is_decoupled_verify_entry_rank():
+            return
+        draft_tail_buffer = self.draft_tail_buffer
+        assert draft_tail_buffer is not None
+        if draft_tail_buffer.has_request(request_id):
+            dst_drafter_rank = self._get_decoupled_drafter_rank_for_request(request_id)
+            self._send_decoupled_verify_control_batches(
+                close_messages=[
+                    DraftClose(
+                        request_id=request_id,
+                        src_verifier_rank=self.dp_rank or 0,
+                        dst_drafter_rank=dst_drafter_rank,
+                        reason=RequestTerminateReason.ABORT,
+                    )
+                ]
+            )
+            self._release_decoupled_drafter_rank_for_request(request_id)
+
+    # -----------------------------------------------------------------------
+    # End of decoupled speculative decoding helpers
+    # -----------------------------------------------------------------------
 
     def init_cache_with_memory_pool(self):
         server_args = self.server_args
@@ -982,6 +1502,9 @@ class Scheduler(
         while True:
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+
+            if self.spec_algorithm.is_decoupled_draft():
+                self._handle_draft_sync_messages()
 
             if self._engine_paused:
                 continue
@@ -1987,11 +2510,36 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        # Decoupled verify: send DraftSync or snapshot draft tail before forward
+        if self.spec_algorithm.is_decoupled_verify() and batch:
+            if batch.forward_mode.is_extend():
+                self._before_process_batch_decoupled_verify(batch)
+            elif batch.forward_mode.is_decode():
+                self._prepare_decoupled_verify_batch(batch)
+
+        # Optionally record decoupled spec trace start time
+        decoupled_trace_forward_start_ns = None
+        if (
+            batch
+            and self.is_generation
+            and self._decoupled_spec_trace_enabled()
+            and (
+                self.spec_algorithm.is_decoupled_verify()
+                or self.spec_algorithm.is_decoupled_draft()
+            )
+        ):
+            self._decoupled_spec_trace_sync_device()
+            decoupled_trace_forward_start_ns = time.perf_counter_ns()
+
         # Run forward
         if self.is_generation:
             batch_or_worker_batch = batch
 
-            if self.enable_overlap or self.spec_algorithm.is_none():
+            if (
+                self.enable_overlap
+                or self.spec_algorithm.is_none()
+                or self.spec_algorithm.is_decoupled_draft()
+            ):
                 # FIXME(lsyin): remove this if and finally unify the abstraction
                 batch_or_worker_batch = batch.get_model_worker_batch()
 
@@ -2090,6 +2638,15 @@ class Scheduler(
             for req in batch.reqs:
                 req.time_stats.prefill_end_time_host = current_time
 
+        # Record decoupled spec trace
+        if decoupled_trace_forward_start_ns is not None:
+            self._decoupled_spec_trace_sync_device()
+            self._record_decoupled_forward_trace(
+                batch,
+                duration_ms=(time.perf_counter_ns() - decoupled_trace_forward_start_ns)
+                / 1_000_000,
+            )
+
         return ret
 
     def launch_batch_sample_if_needed(
@@ -2126,6 +2683,9 @@ class Scheduler(
             if self.enable_overlap:
                 if result.copy_done is not None:
                     result.copy_done.synchronize()
+
+        if self.spec_algorithm.is_decoupled_verify():
+            self._after_process_batch_decoupled_verify(batch)
 
         self.maybe_send_health_check_signal()
 
@@ -2370,6 +2930,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._maybe_abort_decoupled_verify_request(req.rid)
             if self.enable_hicache_storage:
                 # to release prefetch events associated with the request
                 self.tree_cache.release_aborted_request(req.rid)

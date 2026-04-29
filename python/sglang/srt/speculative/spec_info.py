@@ -173,6 +173,12 @@ class SpeculativeAlgorithm(metaclass=_SpeculativeAlgorithmMeta):
     def is_ngram(self) -> bool:
         return self._has_flag("NGRAM")
 
+    def is_decoupled_verify(self) -> bool:
+        return self._has_flag("DECOUPLED_VERIFY")
+
+    def is_decoupled_draft(self) -> bool:
+        return self._has_flag("DECOUPLED_DRAFT")
+
     def create_draft_worker(self, **factory_kwargs: Any) -> Any:
         if self._draft_worker_factory is None:
             return None
@@ -189,6 +195,12 @@ _FLAG_MARKERS: Dict[str, Callable[[Union[SpeculativeAlgorithm, str]], None]] = {
         "STANDALONE", algorithm
     ),
     "NGRAM": lambda algorithm: SpeculativeAlgorithm._add_flag("NGRAM", algorithm),
+    "DECOUPLED_VERIFY": lambda algorithm: SpeculativeAlgorithm._add_flag(
+        "DECOUPLED_VERIFY", algorithm
+    ),
+    "DECOUPLED_DRAFT": lambda algorithm: SpeculativeAlgorithm._add_flag(
+        "DECOUPLED_DRAFT", algorithm
+    ),
 }
 
 
@@ -314,6 +326,31 @@ register_speculative_algorithm(
     "NGRAM",
     worker_cls=_create_ngram_worker,
     flags=("NGRAM",),
+)
+
+
+def _create_decoupled_verify_worker(**kwargs: Any) -> Any:
+    from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+    return VerifyWorker(**kwargs)
+
+
+def _create_decoupled_draft_worker(**kwargs: Any) -> Any:
+    raise ValueError(
+        "decoupled_draft uses the normal TP worker instead of create_draft_worker()."
+    )
+
+
+register_speculative_algorithm(
+    "DECOUPLED_VERIFY",
+    worker_cls=_create_decoupled_verify_worker,
+    flags=("DECOUPLED_VERIFY",),
+)
+
+register_speculative_algorithm(
+    "DECOUPLED_DRAFT",
+    worker_cls=_create_decoupled_draft_worker,
+    flags=("DECOUPLED_DRAFT",),
 )
 
 

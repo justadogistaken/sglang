@@ -41,6 +41,7 @@ import dataclasses
 import logging
 import re
 import time
+from collections import deque
 from enum import Enum, auto
 from http import HTTPStatus
 from itertools import chain
@@ -82,6 +83,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, get_global_server_args
+from sglang.srt.speculative.decoupled_spec_io import DraftReqKey, VerifyCommit
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 
@@ -486,6 +488,7 @@ class Req:
         extra_key: Optional[str] = None,
         dimensions: Optional[int] = None,
         http_worker_ipc: Optional[str] = None,
+        custom_labels: Optional[dict] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -500,6 +503,13 @@ class Req:
         self.output_ids = []
         # fill_ids = origin_input_ids + output_ids. Updated if chunked.
         self.fill_ids = []
+        # Decoupled drafter control state:
+        # (src_verifier_rank, rid), used to identify a draft request
+        self.draft_key: Optional[DraftReqKey] = None
+        # length of the prefix that is committed by the verifier
+        self.verifier_committed_prefix_len: int = 0
+        # verify results received from the verifier, need to be applied to the draft request
+        self.draft_pending_verify_commits: deque[VerifyCommit] = deque()
         self.session_id = session_id
         self.input_embeds = input_embeds
 
@@ -517,6 +527,7 @@ class Req:
 
         # For multi-http worker
         self.http_worker_ipc = http_worker_ipc
+        self.custom_labels = custom_labels
 
         # For reasoning
         self.reasoning = reasoning
@@ -1726,7 +1737,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
+        if not (
+            self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft()
+        ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return

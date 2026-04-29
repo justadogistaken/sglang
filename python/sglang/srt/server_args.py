@@ -415,6 +415,10 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
+    decoupled_spec_control_endpoints: Optional[List[str]] = None
+    decoupled_spec_result_endpoints: Optional[List[str]] = None
+    enable_decoupled_spec_trace: bool = False
+    decoupled_spec_trace_dir: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -1866,6 +1870,64 @@ class ServerArgs:
                     "Currently ngram speculative decoding does not support dp attention."
                 )
 
+        if self.speculative_algorithm in ("DECOUPLED_VERIFY", "DECOUPLED_DRAFT"):
+            if self.enable_piecewise_cuda_graph:
+                logger.warning(
+                    "Piecewise CUDA graph is disabled for decoupled speculative decoding."
+                )
+                self.enable_piecewise_cuda_graph = False
+
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "decoupled speculative decoding does not support dp attention in phase 1."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 64
+                logger.warning(
+                    "Max running requests is reset to 64 for decoupled verify. "
+                    "You can override this by explicitly setting --max-running-requests."
+                )
+
+            if not self.disable_overlap_schedule:
+                logger.warning(
+                    "Overlap scheduler is disabled for decoupled speculative decoding."
+                )
+            self.disable_overlap_schedule = True
+
+            if self.speculative_algorithm == "DECOUPLED_DRAFT":
+                if not self.disable_radix_cache:
+                    logger.warning("Radix cache is disabled for decoupled drafter.")
+                self.disable_radix_cache = True
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled for decoupled speculative decoding."
+                )
+
+            if self.speculative_num_steps is None:
+                raise ValueError(
+                    "decoupled speculative decoding requires speculative_num_steps to be set."
+                )
+
+            if (
+                self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk != 1
+            ):
+                raise ValueError(
+                    "decoupled speculative decoding currently only supports speculative_eagle_topk == 1."
+                )
+            self.speculative_eagle_topk = 1
+
+            expected_num_draft_tokens = self.speculative_num_steps + 1
+            if self.speculative_num_draft_tokens != expected_num_draft_tokens:
+                logger.warning(
+                    "speculative_num_draft_tokens is adjusted to speculative_num_steps + 1 "
+                    "for decoupled speculative decoding."
+                )
+                self.speculative_num_draft_tokens = expected_num_draft_tokens
+
     def _handle_load_format(self):
         if (
             self.load_format == "auto" or self.load_format == "gguf"
@@ -3015,7 +3077,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+                "DECOUPLED_VERIFY",
+                "DECOUPLED_DRAFT",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -3097,6 +3167,38 @@ class ServerArgs:
             choices=MOE_A2A_BACKEND_CHOICES,
             default=ServerArgs.speculative_moe_a2a_backend,
             help="Choose the backend for MoE A2A in speculative decoding",
+        )
+        parser.add_argument(
+            "--decoupled-spec-control-endpoints",
+            type=json_list_type,
+            default=ServerArgs.decoupled_spec_control_endpoints,
+            help=(
+                "JSON list of verifier->drafter control ZMQ endpoints for "
+                "decoupled speculative decoding."
+            ),
+        )
+        parser.add_argument(
+            "--decoupled-spec-result-endpoints",
+            type=json_list_type,
+            default=ServerArgs.decoupled_spec_result_endpoints,
+            help=(
+                "JSON list of drafter->verifier result ZMQ endpoints for "
+                "decoupled speculative decoding."
+            ),
+        )
+        parser.add_argument(
+            "--enable-decoupled-spec-trace",
+            action="store_true",
+            help="Enable batch-level CSV tracing for decoupled speculative decoding.",
+        )
+        parser.add_argument(
+            "--decoupled-spec-trace-dir",
+            type=str,
+            default=ServerArgs.decoupled_spec_trace_dir,
+            help=(
+                "Directory for decoupled speculative decoding CSV trace files. "
+                "Defaults to ./decoupled_spec_trace when tracing is enabled."
+            ),
         )
 
         # Speculative decoding (ngram)
@@ -4520,6 +4622,9 @@ class PortArgs:
     # The ipc filename for Tokenizer and worker tokenizer
     tokenizer_worker_ipc_name: Optional[str]
 
+    # The ipc endpoints between verifier scheduler and drafter scheduler
+    draft_mesh_ipc_config: Optional[Any]
+
     @staticmethod
     def init_new(
         server_args: ServerArgs,
@@ -4545,6 +4650,29 @@ class PortArgs:
         else:
             tokenizer_worker_ipc_name = None
 
+        draft_mesh_ipc_config = None
+        if server_args.speculative_algorithm in ("DECOUPLED_VERIFY", "DECOUPLED_DRAFT"):
+            from sglang.srt.speculative.decoupled_spec_io import DraftMeshIpcConfig
+
+            if (
+                server_args.decoupled_spec_control_endpoints is not None
+                or server_args.decoupled_spec_result_endpoints is not None
+            ):
+                if (
+                    server_args.decoupled_spec_control_endpoints is None
+                    or server_args.decoupled_spec_result_endpoints is None
+                ):
+                    raise ValueError(
+                        "Both --decoupled-spec-control-endpoints and "
+                        "--decoupled-spec-result-endpoints must be provided together."
+                    )
+                draft_mesh_ipc_config = DraftMeshIpcConfig.from_endpoint_lists(
+                    server_args.decoupled_spec_control_endpoints,
+                    server_args.decoupled_spec_result_endpoints,
+                )
+            else:
+                draft_mesh_ipc_config = DraftMeshIpcConfig.init_new(server_args.dp_size)
+
         if not server_args.enable_dp_attention:
             # Normal case, use IPC within a single node
             return PortArgs(
@@ -4555,6 +4683,7 @@ class PortArgs:
                 rpc_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 metrics_ipc_name=f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                draft_mesh_ipc_config=draft_mesh_ipc_config,
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
@@ -4609,6 +4738,7 @@ class PortArgs:
                 rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
                 metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_name}",
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
+                draft_mesh_ipc_config=draft_mesh_ipc_config,
             )
 
 
