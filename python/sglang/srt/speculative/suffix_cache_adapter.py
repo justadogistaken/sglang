@@ -279,58 +279,66 @@ class SuffixCacheAdapter:
                           or spec disabled from start). If None, tokens are treated as
                           continuation of existing requests.
         """
+        # logger.info(
+        #     "[SuffixCacheAdapter::batch_put] enter: num_reqs=%d, has_prompts=%s, "
+        #     "first_req_id=%s, first_token_len=%d, first_prompt_len=%d",
+        #     len(batch_req_ids),
+        #     batch_prompts is not None,
+        #     batch_req_ids[0] if batch_req_ids else None,
+        #     len(batch_tokens[0]) if batch_tokens else -1,
+        #     len(batch_prompts[0]) if batch_prompts else -1,
+        # )
 
-        return None
-        # Cleanup requests that are no longer active in the current batch
-        # This is important when speculative decoding is disabled, as batch_get won't be called
-        # active_req_ids = set(batch_req_ids)
-        # self._cleanup_inactive_requests(active_req_ids)
+        is_external_update = batch_prompts is not None
 
-        # for idx, (sglang_req_id, tokens) in enumerate(
-        #     zip(batch_req_ids, batch_tokens)
-        # ):
-        #     if not tokens:
-        #         continue
+        # Only cleanup for internal flow.
+        # External updates come from other rollout instances and should not affect
+        # currently active local requests.
+        if not is_external_update:
+            active_req_ids = set(batch_req_ids)
+            self._cleanup_inactive_requests(active_req_ids)
 
-        #     # Check if this request is already being tracked (normal spec flow)
-        #     if sglang_req_id in self.req_state:
-        #         cache_req_id, last_length = self.req_state[sglang_req_id]
-        #         current_length = len(tokens)
+        for idx, (sglang_req_id, tokens) in enumerate(zip(batch_req_ids, batch_tokens)):
+            if not tokens:
+                continue
 
-        #         # If we have new tokens to add (normal spec flow)
-        #         if current_length > last_length:
-        #             new_tokens = tokens[last_length:current_length]
-        #             if cache_req_id in self.suffix_cache.active_requests:
-        #                 # Update via add_active_response for active requests (incremental update)
-        #                 self.suffix_cache.add_active_response(cache_req_id, new_tokens)
-        #                 self.req_state[sglang_req_id][1] = current_length
-        #             else:
-        #                 # Request is not active anymore, need to re-add to cache
-        #                 # Use prompt if provided, otherwise use the tokens as both prompt and response
-        #                 if batch_prompts is not None and idx < len(batch_prompts):
-        #                     prompt = batch_prompts[idx]
-        #                     response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
-        #                 else:
-        #                     # Fallback: treat all tokens as prompt, no response
-        #                     prompt = tokens
-        #                     response = []
+            if sglang_req_id in self.req_state:
+                cache_req_id, last_length = self.req_state[sglang_req_id]
+                current_length = len(tokens)
 
-        #                 self._add_completed_request_to_cache(
-        #                     sglang_req_id, prompt, response
-        #                 )
-        #                 self.req_state.pop(sglang_req_id, None)
-        #     else:
-        #         # Request not tracked (spec was disabled from start, or external update)
-        #         # Need prompt to properly add to cache
-        #         if batch_prompts is not None and idx < len(batch_prompts):
-        #             prompt = batch_prompts[idx]
-        #             response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
-        #         else:
-        #             # Fallback: treat all tokens as prompt (less effective but still works)
-        #             prompt = tokens
-        #             response = []
+                if current_length > last_length:
+                    new_tokens = tokens[last_length:current_length]
+                    if cache_req_id in self.suffix_cache.active_requests:
+                        self.suffix_cache.add_active_response(cache_req_id, new_tokens)
+                        self.req_state[sglang_req_id][1] = current_length
+                    else:
+                        if batch_prompts is not None and idx < len(batch_prompts):
+                            prompt = batch_prompts[idx]
+                            response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
+                        else:
+                            prompt = tokens
+                            response = []
 
-        #         self._add_completed_request_to_cache(sglang_req_id, prompt, response)
+                        self._add_completed_request_to_cache(
+                            sglang_req_id, prompt, response
+                        )
+                        self.req_state.pop(sglang_req_id, None)
+            else:
+                if batch_prompts is not None and idx < len(batch_prompts):
+                    prompt = batch_prompts[idx]
+                    response = tokens[len(prompt):] if len(tokens) > len(prompt) else []
+                else:
+                    prompt = tokens
+                    response = []
+
+                self._add_completed_request_to_cache(sglang_req_id, prompt, response)
+
+        # logger.info(
+        #     "[SuffixCacheAdapter::batch_put] exit: cached_requests=%d, active_requests=%d, req_state=%d",
+        #     len(self.suffix_cache.cached_requests),
+        #     len(self.suffix_cache.active_requests),
+        #     len(self.req_state),
+        # )
 
     def _add_completed_request_to_cache(self, req_id: str, prompt: List[int],
                                         response: List[int]):

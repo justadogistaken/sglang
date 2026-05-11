@@ -366,7 +366,7 @@ class Scheduler(
             if hasattr(self.draft_worker, "ngram_cache"):
                 cache_adapter = self.draft_worker.ngram_cache
                 self.suffix_cache_server = SuffixCacheServer(
-                    port=server_args.speculative_suffix_cache_server_port,
+                    port=server_args.speculative_suffix_cache_server_port + gpu_id,
                     cache_adapter=cache_adapter,
                 )
                 self.suffix_cache_server.start()
@@ -2061,6 +2061,9 @@ class Scheduler(
         - Enable speculative decoding (keep original spec_algorithm)
         - Disable overlap scheduling (spec requires normal scheduling)
         """
+        if not self.speculative_disable_batch_size_threshold:
+            return
+        
         if self.speculative_disable_batch_size_threshold <= 0:
             # Dynamic threshold not set, use original behavior
             return

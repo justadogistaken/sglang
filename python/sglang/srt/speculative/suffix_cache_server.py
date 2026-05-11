@@ -50,9 +50,57 @@ class SuffixCacheRequestHandler(BaseHTTPRequestHandler):
         else:
             self._send_json_response(404, {"error": "Not found"})
 
+    def _validate_update_item(self, data: dict):
+        if not isinstance(data, dict):
+            return False, "item must be a dict"
+
+        if "request_id" not in data:
+            return False, "Missing 'request_id' field"
+        if "token_ids" not in data:
+            return False, "Missing 'token_ids' field"
+
+        request_id = data["request_id"]
+        token_ids = data["token_ids"]
+        prompt_length = data.get("prompt_length", 0)
+
+        if not isinstance(token_ids, list) or not all(isinstance(t, int) for t in token_ids):
+            return False, "'token_ids' must be a list of integers"
+
+        if not isinstance(prompt_length, int) or prompt_length < 0:
+            return False, "'prompt_length' must be a non-negative integer"
+
+        if prompt_length > len(token_ids):
+            return False, "'prompt_length' cannot exceed total token count"
+
+        return True, (request_id, token_ids, prompt_length)
+
+
+    def _handle_one_update(self, data: dict):
+        ok, parsed_or_error = self._validate_update_item(data)
+        if not ok:
+            raise ValueError(parsed_or_error)
+
+        request_id, token_ids, prompt_length = parsed_or_error
+        prompt = token_ids[:prompt_length]
+        response = token_ids[prompt_length:]
+
+        self.cache_adapter.batch_put(
+            batch_req_ids=[request_id],
+            batch_tokens=[token_ids],
+            batch_prompts=[prompt],
+        )
+
+        return {
+            "status": "success",
+            "request_id": request_id,
+            "prompt_length": prompt_length,
+            "response_length": len(response),
+            "total_tokens": len(token_ids),
+        }
+
     def do_POST(self):
         """Handle POST requests - cache updates."""
-        if self.path != "/update_cache":
+        if self.path not in ["/update_cache", "/update_cache_batch"]:
             self._send_json_response(404, {"error": "Not found"})
             return
 
@@ -66,62 +114,102 @@ class SuffixCacheRequestHandler(BaseHTTPRequestHandler):
             body = self.rfile.read(content_length)
             data = json.loads(body.decode("utf-8"))
 
-            # Validate required fields
-            if "request_id" not in data:
-                self._send_json_response(400, {"error": "Missing 'request_id' field"})
-                return
-            if "token_ids" not in data:
-                self._send_json_response(400, {"error": "Missing 'token_ids' field"})
+            if self.path == "/update_cache":
+                result = self._handle_one_update(data)
+                self._send_json_response(200, result)
                 return
 
-            request_id = data["request_id"]
-            token_ids = data["token_ids"]
-            prompt_length = data.get("prompt_length", 0)  # Optional, defaults to 0
-
-            # Validate token_ids is a list of integers
-            if not isinstance(token_ids, list) or not all(
-                isinstance(t, int) for t in token_ids
-            ):
+            # /update_cache_batch
+            if not isinstance(data, list):
                 self._send_json_response(
-                    400, {"error": "'token_ids' must be a list of integers"}
+                    400, {"error": "Batch update body must be a list"}
                 )
                 return
 
-            # Validate prompt_length
-            if not isinstance(prompt_length, int) or prompt_length < 0:
-                self._send_json_response(
-                    400, {"error": "'prompt_length' must be a non-negative integer"}
+            batch_req_ids = []
+            batch_tokens = []
+            batch_prompts = []
+            results = []
+
+            for idx, item in enumerate(data):
+                ok, parsed_or_error = self._validate_update_item(item)
+                if not ok:
+                    self._send_json_response(
+                        400,
+                        {
+                            "error": f"Invalid item at index {idx}: {parsed_or_error}",
+                        },
+                    )
+                    return
+
+                request_id, token_ids, prompt_length = parsed_or_error
+                prompt = token_ids[:prompt_length]
+                response = token_ids[prompt_length:]
+
+                batch_req_ids.append(request_id)
+                batch_tokens.append(token_ids)
+                batch_prompts.append(prompt)
+
+                results.append(
+                    {
+                        "status": "success",
+                        "request_id": request_id,
+                        "prompt_length": prompt_length,
+                        "response_length": len(response),
+                        "total_tokens": len(token_ids),
+                    }
                 )
-                return
+            
+            # logger.info(
+            #     "[SuffixCacheRequestHandler::do_POST] "
+            #     "tp? cache_adapter_id=%s suffix_cache_id=%s cached_requests_id=%s",
+            #     id(self.cache_adapter),
+            #     id(self.cache_adapter.suffix_cache),
+            #     id(self.cache_adapter.suffix_cache.cached_requests),
+            # )
 
-            if prompt_length > len(token_ids):
-                self._send_json_response(
-                    400,
-                    {"error": "'prompt_length' cannot exceed total token count"},
+            if batch_req_ids:
+
+                # cached_requests = self.cache_adapter.suffix_cache.cached_requests
+                
+                # before_keys = set(cached_requests)
+                # before_len = len(cached_requests)
+                
+                self.cache_adapter.batch_put(
+                    batch_req_ids=batch_req_ids,
+                    batch_tokens=batch_tokens,
+                    batch_prompts=batch_prompts,
                 )
-                return
 
-            # Split tokens into prompt and response
-            prompt = token_ids[:prompt_length]
-            response = token_ids[prompt_length:]
+                # cached_requests = self.cache_adapter.suffix_cache.cached_requests
 
-            # Update the cache using batch_put with prompt info
-            # This will properly add the request to global cache via:
-            # start_request -> add_active_response -> stop_request
-            self.cache_adapter.batch_put(
-                batch_req_ids=[request_id],
-                batch_tokens=[token_ids],
-                batch_prompts=[prompt],
-            )
+                # after_keys = set(cached_requests)
+                # after_len = len(cached_requests)
+
+                # inserted = [rid for rid in batch_req_ids if rid in after_keys]
+                # evicted = before_keys - after_keys
+
+                # logger.info(
+                #     "[SuffixCacheRequestHandler::do_POST] update_cache_batch: "
+                #     "num_updates=%d, len %d -> %d, delta=%d, "
+                #     "inserted=%d, evicted=%d, "
+                #     "first_req_id=%s, in_after=%s",
+                #     len(batch_req_ids),
+                #     before_len,
+                #     after_len,
+                #     after_len - before_len,
+                #     len(inserted),
+                #     len(evicted),
+                #     batch_req_ids[0] if batch_req_ids else None,
+                #     batch_req_ids[0] in after_keys if batch_req_ids else None,
+                # )
 
             self._send_json_response(
                 200,
                 {
                     "status": "success",
-                    "request_id": request_id,
-                    "prompt_length": prompt_length,
-                    "response_length": len(response),
-                    "total_tokens": len(token_ids),
+                    "num_updates": len(batch_req_ids),
+                    "results": results,
                 },
             )
 

@@ -149,6 +149,8 @@ def set_global_state(global_state: _GlobalState):
     global _global_state
     _global_state = global_state
 
+def get_global_state() -> _GlobalState:
+    return _global_state
 
 async def init_multi_tokenizer() -> ServerArgs:
     """Read args information from shm and init tokenizer manager for current process"""
